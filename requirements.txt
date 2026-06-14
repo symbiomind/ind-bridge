@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+httpx
+pyyaml
+python-dotenv
+openai
+mcp
+croniter
+pytest
+pytest-asyncio

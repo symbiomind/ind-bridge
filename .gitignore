@@ -1,0 +1,51 @@
+# Project Directories
+data/*
+notes/
+.obsidian/
+.claude/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv
+
+# temporary ignore:
+docs/
+tests/
+
+# Env
+.env
+.env.*
+*.env
+!.env.example
+
+# Config (contains tokens — use config.example.yml as template)
+config.yml
+!config.example.yml
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.clinerules/
+CLAUDE.md
+
+# Logs
+logs/
+
+# User plugins (bind-mounted volume, not tracked in git)
+# Directory created automatically by docker-compose volume mount
+plugins/user/
+
+# Docker
+*.log
+test-compose.yml
+docker-compose.yml
+!docker-compose.example.yml
+
+# Backups
+*.bak

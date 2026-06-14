@@ -1,0 +1,27 @@
+# quirks_mode/models.yml — known-good model → quirk recipes ("the cheat sheet")
+#
+# Maps a real model string to the list of provider-compat quirks that model is
+# known to need. A buddy on that model just sets `quirks_mode: {model: "<key>"}`
+# and inherits the proven recipe — no need to re-derive the quirks by hand.
+#
+# Adding a model: bring it up with a hand `quirks: [...]` list (the workbench),
+# find the working set, then bottle it here as a new entry. See README.md.
+#
+# This file SHIPS with the plugin. Because the bridge runs in Docker, you can
+# bind-mount your own models.yml over this path to extend/override it without
+# touching plugin code.
+#
+# Valid quirk names (see __init__.py _KNOWN_QUIRKS):
+#   reattach_reasoning    — restore captured reasoning onto round-tripped tool turns
+#   mirror_reasoning_key  — mirror `reasoning` → `reasoning_content` (key-drift)
+#   close_trailing_orphan — close a trailing unanswered tool call with a synthetic result
+
+"moonshotai/kimi-k2.5":
+  - reattach_reasoning
+  - mirror_reasoning_key
+  - close_trailing_orphan
+
+# "moonshotai/kimi-k2.6":   # add once characterised — may match k2.5, may differ
+#   - reattach_reasoning
+#   - mirror_reasoning_key
+#   - close_trailing_orphan

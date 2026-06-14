@@ -1,0 +1,598 @@
+"""
+mcp_client — connect MCP servers, offer their tools to the agent as
+bridge-native tools (V4).
+
+The payoff of the ``bridge_native__`` namespace channel: an operator adds an
+MCP (Model Context Protocol) server to config and the AI agent gains that
+server's tools — file management, memory, search, whatever the server exposes —
+with ZERO hand-written tool code.
+
+Three capabilities, one plugin (the agent_tools shape, plus discovery):
+
+  * ``background`` (D-011) — at startup, connect to each configured MCP server
+    and ``list_tools()`` to DISCOVER what it offers. Fail-open: a server that's
+    down/slow at boot is logged and skipped (its tools just aren't offered this
+    run); the bridge always starts; other servers are unaffected.
+
+  * ``context_modify`` — inject the discovered tool definitions into
+    ``ctx.request.tools`` (the OpenAI function list — NOT ctx.bridge_context),
+    exactly like agent_tools. The agent sees them as native callable tools.
+
+  * ``handle_tool_calls`` (D-008) — when the agent calls one, route it to the
+    right MCP server and execute it (fresh connection per call, like
+    conversational_memory), returning the result as the tool-result string.
+
+Three-layer tool name the agent sees::
+
+    bridge_native__  +  <server_key>__  +  <mcp_tool_name>
+    e.g.  bridge_native__diary__store_memory
+
+  * ``bridge_native__`` — the bridge-wide invariant (app/bridge_native.py),
+    applied at injection / stripped at dispatch by CORE. Already built.
+  * ``<server_key>__`` — THIS plugin's own sub-namespace (the per-server config
+    key), so two MCP servers exposing the same tool name don't collide. We apply
+    it when building names and ``split("__", 1)`` it back at dispatch to route.
+  * ``<mcp_tool_name>`` — the server's real tool name, stored verbatim (never
+    reconstructed by splitting, so a tool name containing ``__`` survives).
+
+Dynamic ownership: because tools are DISCOVERED at startup (after the validator
+runs), ``OWNED_TOOLS`` is a CALLABLE, not a static list. Core's
+``_plugin_owned_tools`` calls it; the validator treats a callable as satisfying
+the D-008 presence invariant.
+
+Config (operator writes the server map ONCE at role.plugins)::
+
+    resources:
+      my_agent_diary_mcp: {endpoint_url: http://...:6005/mcp, token: ${SECRET_A}, timeout: 120}
+    identities:
+      my_agent: { plugins: { mcp_client: {} } }        # background discovery trigger
+    roles:
+      my_agent_role:
+        plugins:
+          mcp_client:                                  # server map + handle_tool_calls
+            diary:        { resource: my_agent_diary_mcp }  # optional: tools: [allowlist]
+            personal-mcp: { resource: personal_mcp }
+        context:
+          plugins:
+            mcp_client: {}                             # inject tools
+
+Constraints: a ``server_key`` must NOT contain ``__`` (it collides with the
+sub-namespace separator — warn-and-skip). Optional per-server ``tools:``
+allowlist restricts which discovered tools are offered.
+
+Parked for future-us: reconnect/retry of a server that was down at boot (needs
+more dogfooding/research); cross-plugin collisions among dynamic tools (can't be
+validated at startup).
+"""
+
+from __future__ import annotations
+
+import copy
+import json
+import logging
+from typing import TYPE_CHECKING
+
+from app import bridge_native
+
+if TYPE_CHECKING:
+    from app.context import PipelineCtx, StartupCtx
+
+logger = logging.getLogger(__name__)
+
+
+CAPABILITIES = {
+    "background":        ["identity.plugins"],
+    "context_modify":    ["identity.context.plugins", "role.context.plugins"],
+    "handle_tool_calls": ["identity.plugins", "role.plugins"],
+}
+
+_NS_SEP = "__"  # sub-namespace separator (matches bridge_native's prefix style)
+
+# ---------------------------------------------------------------------------
+# Module state — populated ONCE by start_background at boot (lifespan step 6,
+# discovery awaited inline before the coro returns), read thereafter by
+# modify_context / handle_tool_calls / OWNED_TOOLS(). Single-writer-at-boot,
+# many-reader-per-request — no lock needed (conv_mem's _resource_cache style).
+# ---------------------------------------------------------------------------
+
+# Registry is keyed by (resource_key, tool_name) — the RESOURCE, not the
+# server_key alias. Two roles can name a server the same (`filesystem`) while
+# pointing at DIFFERENT resources (`agent_a_filesystem` vs `filesystem`); the
+# server_key is buddy-facing presentation, the resource is the true identity, so
+# routing/defs key on the resource to avoid cross-role collision (last-writer-wins
+# bleed). The buddy-facing wire name still uses server_key — built per-role at
+# injection by mapping the role's server_key → resource_key.
+_tool_defs: dict[tuple[str, str], dict] = {}
+"""``(resource_key, tool_name)`` → OpenAI function def dict, built with the RAW
+tool name (no server_key, no bridge_native prefix). modify_context applies the
+``bridge_native__<server_key>__`` layer per-role at injection."""
+
+_tool_routes: dict[tuple[str, str], tuple[dict, str]] = {}
+"""``(resource_key, tool_name)`` → (conn dict, raw MCP tool name). The raw tool
+name is stored verbatim so a ``__``-containing tool name is never reconstructed
+by splitting — dispatch reads it straight from here."""
+
+
+# ---------------------------------------------------------------------------
+# OWNED_TOOLS — a CALLABLE (dynamic; discovered at startup)
+# ---------------------------------------------------------------------------
+
+def OWNED_TOOLS() -> list[str]:
+    """Dynamic owned-tools list. Core's ``_plugin_owned_tools`` calls this when
+    the attribute is callable; the D-008 validator treats 'callable present' as
+    satisfying the non-empty presence invariant (discovery hasn't run at
+    validation time).
+
+    Claimable names are the BUDDY-FACING ``server_key__tool`` forms (NO
+    bridge_native prefix; core strips it before matching). The registry is keyed
+    by resource (not server_key) and the wire name uses server_key, so we map
+    each DISCOVERED resource back to EVERY server_key alias that points at it,
+    across all roles, and emit ``server_key__tool`` for each. This is
+    presence-only (does the bridge own this name?) — the per-role gate in
+    modify_context/handle_tool_calls is what actually scopes a given identity.
+
+    NOTE (regression guard): we invert resource→server_keys here rather than
+    reading a flat ``{server_key: resource_key}`` map. Multiple roles can share a
+    server_key (`filesystem` → agent_a_filesystem / agent_b_filesystem); a flat
+    map collides on the key and would drop every alias but one — and if the
+    survivor is an UNdiscovered/stale resource (e.g. a role still pointing
+    `filesystem` at a now-deleted `filesystem` resource), the real discovered
+    tools get skipped entirely, never claimed, and LEAK to the harness as "tool
+    not found". Build resource→{server_keys} so every alias of every discovered
+    resource is represented."""
+    # resource_key -> set of server_key aliases that map onto it (across roles)
+    resource_to_aliases: dict[str, set[str]] = {}
+    for server_key, resource_key in _all_server_to_resource_pairs():
+        resource_to_aliases.setdefault(resource_key, set()).add(server_key)
+
+    names: set[str] = set()
+    for (resource_key, tool) in _tool_defs:  # only DISCOVERED (resource, tool)
+        for server_key in resource_to_aliases.get(resource_key, set()):
+            names.add(_join_name(server_key, tool))
+    return sorted(names)
+
+
+# ---------------------------------------------------------------------------
+# Namespacing helpers (server_key sub-layer; bridge_native is core's job)
+# ---------------------------------------------------------------------------
+
+def _join_name(server_key: str, tool_name: str) -> str:
+    return f"{server_key}{_NS_SEP}{tool_name}"
+
+
+def _split_name(clean_name: str) -> tuple[str, str] | None:
+    """Split a ``server__tool`` name into (server_key, tool_name). Split ONCE,
+    leftmost — server_key is the first segment, the rest is the tool name
+    verbatim (so a tool name containing ``__`` survives). Returns None if there
+    is no separator."""
+    if _NS_SEP not in clean_name:
+        return None
+    server_key, tool_name = clean_name.split(_NS_SEP, 1)
+    return server_key, tool_name
+
+
+# ---------------------------------------------------------------------------
+# Resource resolution (conv_mem / memory_enricher pattern)
+# ---------------------------------------------------------------------------
+
+def _resolve_conn(resource_key: str | None) -> dict | None:
+    """Resolve an MCP-shape resource to ``{endpoint_url, token, timeout}``.
+    Returns None (caller warns + skips) when missing or has no endpoint_url."""
+    if not resource_key:
+        return None
+    from app import config as app_config
+    cfg = app_config.resolve_resource(resource_key) or {}
+    endpoint_url = cfg.get("endpoint_url")
+    if not endpoint_url:
+        return None
+    timeout_raw = cfg.get("timeout")
+    return {
+        "endpoint_url": endpoint_url,
+        "token": cfg.get("token") or "",
+        "timeout": float(timeout_raw) if timeout_raw is not None else 120.0,
+    }
+
+
+# ---------------------------------------------------------------------------
+# start_background — locate the server map, return the discovery coroutine
+# ---------------------------------------------------------------------------
+
+def start_background(ctx: "StartupCtx", config: dict):
+    """Locate this identity's MCP server map and return the one-shot discovery
+    coroutine for core to schedule. Returns None (no task) when no servers are
+    configured — DLC-grace.
+
+    CONFIG-LOCATION GOTCHA: ``_spawn_background_tasks`` hands us the
+    ``identity.plugins.mcp_client`` block as ``config``, but the server map
+    lives at ``role.plugins.mcp_client`` (and ``ctx.identity_cfg`` is the RAW
+    identity block — NOT cascade-merged with the role). So we resolve the role
+    ourselves. Fall back to ``config`` if the map was placed on the identity."""
+    from app import config as app_config
+
+    server_map = _find_server_map(ctx, config, app_config)
+    if not server_map:
+        logger.info(
+            f"mcp_client: identity '{ctx.identity_key}' has no MCP servers "
+            f"configured (role.plugins.mcp_client is empty) — discovery skipped."
+        )
+        return None
+
+    return _discover_all(server_map)
+
+
+def _find_server_map(ctx: "StartupCtx", config: dict, app_config) -> dict:
+    """The server map is a dict of ``server_key -> {resource, tools?}``. Prefer
+    the role's ``plugins.mcp_client`` block; fall back to the passed identity
+    block. Entries whose value isn't a dict (e.g. a bare ``mcp_client: {}``
+    marker) are ignored — they're the inject/handle wiring, not the map."""
+    role_key = app_config.get_identity_role_key(ctx.identity_key)
+    role_cfg = app_config.resolve_role(role_key) if role_key else None
+    if role_cfg:
+        candidate = (role_cfg.get("plugins") or {}).get("mcp_client")
+        mapped = _only_server_entries(candidate)
+        if mapped:
+            return mapped
+    # Fall back to the identity.plugins.mcp_client block we were handed.
+    return _only_server_entries(config)
+
+
+def _only_server_entries(block) -> dict:
+    """Keep only ``server_key -> {dict}`` entries from a plugin config block."""
+    if not isinstance(block, dict):
+        return {}
+    return {k: v for k, v in block.items() if isinstance(v, dict)}
+
+
+def _role_server_keys(ctx: "PipelineCtx") -> set[str]:
+    """The set of MCP server keys THIS role may use — resolved from the role's
+    ``plugins.mcp_client`` server map. Discovery is module-GLOBAL (one shared
+    `_tool_defs`/`_tool_routes` across all identities), so both injection
+    (modify_context) and dispatch (handle_tool_calls) MUST gate on this set —
+    otherwise a role configured for only 'filesystem' would be offered (and
+    could route to) another identity's 'diary' tools. Exposure is
+    per-cascade-level even though discovery is global.
+
+    Returns an empty set if the role declares no server map (→ no MCP tools for
+    this role)."""
+    from app import config as app_config
+    role_key = getattr(ctx.role, "key", None)
+    role_cfg = app_config.resolve_role(role_key) if role_key else None
+    if not role_cfg:
+        return set()
+    server_map = _only_server_entries((role_cfg.get("plugins") or {}).get("mcp_client"))
+    return set(server_map.keys())
+
+
+def _role_server_map(ctx: "PipelineCtx") -> dict[str, dict]:
+    """THIS role's full ``server_key -> {resource, tools?}`` map (raw). Used to
+    read per-server ``tools:`` allowlists at injection. Empty if none."""
+    from app import config as app_config
+    role_key = getattr(ctx.role, "key", None)
+    role_cfg = app_config.resolve_role(role_key) if role_key else None
+    if not role_cfg:
+        return {}
+    return _only_server_entries((role_cfg.get("plugins") or {}).get("mcp_client"))
+
+
+def _role_server_to_resource(ctx: "PipelineCtx") -> dict[str, str]:
+    """THIS role's ``server_key -> resource_key`` map (from
+    ``role.plugins.mcp_client``). The registry is keyed by resource, so injection
+    and dispatch use this to translate the buddy-facing server_key alias into the
+    resource whose discovered tools/route to use. Empty if the role declares no
+    server map. (Server entries with no ``resource`` are skipped.)"""
+    from app import config as app_config
+    role_key = getattr(ctx.role, "key", None)
+    role_cfg = app_config.resolve_role(role_key) if role_key else None
+    if not role_cfg:
+        return {}
+    server_map = _only_server_entries((role_cfg.get("plugins") or {}).get("mcp_client"))
+    out: dict[str, str] = {}
+    for server_key, server_cfg in server_map.items():
+        resource_key = server_cfg.get("resource")
+        if resource_key:
+            out[server_key] = resource_key
+    return out
+
+
+def _all_server_to_resource_pairs() -> list[tuple[str, str]]:
+    """Every ``(server_key, resource_key)`` pair across all roles' mcp_client
+    maps — as a LIST of pairs, NOT a dict. A dict keyed by server_key collides
+    when multiple roles share a server_key (`filesystem` → three different
+    per-buddy resources) and silently drops all but one alias, which broke
+    OWNED_TOOLS claim-matching (the dropped survivor could be a stale/undiscovered
+    resource → filesystem tools never claimed → leaked to the harness). Keeping
+    pairs preserves every alias→resource edge."""
+    from app import config as app_config
+    pairs: list[tuple[str, str]] = []
+    try:
+        roles = (app_config.get_server_cfg() or {}).get("roles") or {}
+    except Exception:
+        return pairs
+    for role_cfg in roles.values():
+        if not isinstance(role_cfg, dict):
+            continue
+        server_map = _only_server_entries((role_cfg.get("plugins") or {}).get("mcp_client"))
+        for server_key, server_cfg in server_map.items():
+            resource_key = server_cfg.get("resource")
+            if resource_key:
+                pairs.append((server_key, resource_key))
+    return pairs
+
+
+# ---------------------------------------------------------------------------
+# Discovery (one-shot at boot, fail-open per server)
+# ---------------------------------------------------------------------------
+
+async def _discover_all(server_map: dict) -> None:
+    """Connect to each server, list its tools, register defs + routes keyed by
+    ``(resource_key, tool_name)``. One-shot: no persistent connection, no
+    keep-alive loop (fresh connection per call at execution time). Fail-open: a
+    server that errors is logged and skipped; the others still register.
+
+    Resource-keyed so two roles' same-named servers (`filesystem`) pointing at
+    DIFFERENT resources don't collide. DEDUPE by resource: this coroutine runs
+    once per identity at boot, and several identities may map to the same
+    resource — we only list a resource's tools ONCE (already-discovered →
+    skip). The per-server ``tools:`` allowlist is NOT applied here (it's
+    per-role/per-server presentation, applied at injection in modify_context);
+    discovery registers everything the resource exposes.
+
+    Parked for future-us: reconnect/retry of a server that was down at boot
+    (needs more dogfooding/research). Discovery is one-shot here."""
+    resources_ok = 0
+    for server_key, server_cfg in server_map.items():
+        if _NS_SEP in server_key:
+            logger.warning(
+                f"mcp_client: server key '{server_key}' contains '{_NS_SEP}', "
+                f"which collides with the sub-namespace separator — skipping. "
+                f"Rename the server key."
+            )
+            continue
+
+        resource_key = server_cfg.get("resource")
+        if not resource_key:
+            logger.warning(
+                f"mcp_client: server '{server_key}' has no 'resource' — skipping."
+            )
+            continue
+
+        # Already discovered this resource (another identity/role got here first
+        # this boot)? The registry is resource-keyed, so don't re-list it.
+        if any(res == resource_key for (res, _tool) in _tool_defs):
+            continue
+
+        conn = _resolve_conn(resource_key)
+        if conn is None:
+            logger.warning(
+                f"mcp_client: server '{server_key}' resource '{resource_key}' "
+                f"unresolved (missing or no endpoint_url) — skipping this server."
+            )
+            continue
+
+        try:
+            tools = await _list_tools(conn)
+        except Exception as e:
+            logger.warning(
+                f"mcp_client: discovery failed for resource '{resource_key}' "
+                f"(server '{server_key}', {type(e).__name__}: {e}) — its tools "
+                f"won't be offered this run. (Reconnect/retry parked for future-us.)"
+            )
+            continue
+
+        count = 0
+        for t in tools:
+            raw_name = getattr(t, "name", None)
+            if not raw_name:
+                continue
+            key = (resource_key, raw_name)
+            # def built with the RAW tool name; modify_context applies the
+            # bridge_native__<server_key>__ wire-name layer per-role.
+            _tool_defs[key] = _build_openai_def(raw_name, t)
+            _tool_routes[key] = (conn, raw_name)
+            count += 1
+        resources_ok += 1
+        logger.info(
+            f"mcp_client: resource '{resource_key}' (server '{server_key}') — "
+            f"discovered {count} tool(s)."
+        )
+
+    logger.info(
+        f"mcp_client: discovery complete — {len(_tool_defs)} tool(s) across "
+        f"{resources_ok} resource(s) this pass."
+    )
+
+
+def _build_openai_def(clean_name: str, tool) -> dict:
+    """Build an OpenAI function-tool def from an MCP Tool. ``inputSchema`` is a
+    JSON Schema object — the same shape OpenAI's ``function.parameters`` wants —
+    so it's used directly; empty/None substitutes a minimal object schema."""
+    schema = getattr(tool, "inputSchema", None) or {"type": "object", "properties": {}}
+    return {
+        "type": "function",
+        "function": {
+            "name": clean_name,  # CLEAN — bridge_native applied at injection
+            "description": getattr(tool, "description", "") or "",
+            "parameters": schema,
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# MCP calls — fresh connection per call (conversational_memory's pattern)
+# ---------------------------------------------------------------------------
+
+async def _list_tools(conn: dict) -> list:
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamablehttp_client
+
+    token = conn["token"]
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    async with streamablehttp_client(conn["endpoint_url"], headers=headers) as (read, write, _):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            result = await session.list_tools()
+            return list(result.tools)
+
+
+async def _call_tool(conn: dict, raw_tool_name: str, args: dict):
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamablehttp_client
+
+    token = conn["token"]
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    async with streamablehttp_client(conn["endpoint_url"], headers=headers) as (read, write, _):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            return await session.call_tool(raw_tool_name, arguments=args)
+
+
+def _stringify(result) -> str:
+    """Extract text content from an MCP CallToolResult and hand it to the buddy
+    as the tool-result string. Unlike conv_mem (which json.loads to consume
+    structured fields), we pass the raw text through — the buddy reads it."""
+    try:
+        parts = []
+        for item in getattr(result, "content", None) or []:
+            text = getattr(item, "text", None)
+            if text:
+                parts.append(text)
+        if parts:
+            return "\n".join(parts)
+    except Exception as e:
+        logger.warning(f"mcp_client: result parse failed — {e}")
+    return "[mcp_client: tool returned no text content]"
+
+
+# ---------------------------------------------------------------------------
+# context_modify — inject discovered tool defs (mirror agent_tools)
+# ---------------------------------------------------------------------------
+
+def modify_context(ctx: "PipelineCtx", config: dict) -> "PipelineCtx":
+    """Inject the discovered MCP tools into ``ctx.request.tools``, applying the
+    ``bridge_native__`` prefix at the boundary (same as agent_tools). Honours an
+    optional ``tools:`` allowlist on this context block (accepts ``server__tool``
+    or bare ``tool`` forms). De-dupes against client-supplied tools."""
+    allow = config.get("tools")
+    if allow is not None and not isinstance(allow, list):
+        logger.warning(
+            f"mcp_client: 'tools' allowlist must be a list; got "
+            f"{type(allow).__name__}. Ignoring the allowlist."
+        )
+        allow = None
+
+    # Per-role server→resource map: discovery is GLOBAL and resource-keyed, but a
+    # role may only be offered tools from the servers IT configured, routed to
+    # ITS OWN resources. Resolving server_key→resource here is what makes two
+    # roles' same-named 'filesystem' servers inject from their OWN endpoints.
+    server_to_resource = _role_server_to_resource(ctx)
+    if not server_to_resource:
+        return ctx  # this role declares no MCP servers — offer nothing
+
+    # Per-server allowlists (role.plugins.mcp_client.<server>.tools) — applied
+    # here, not at discovery, because the registry is resource-keyed and shared.
+    role_server_map = _role_server_map(ctx)
+
+    existing = {
+        t.get("function", {}).get("name")
+        for t in ctx.request.tools
+        if isinstance(t, dict)
+    }
+    to_add = []
+    for server_key, resource_key in server_to_resource.items():
+        per_server_allow = (role_server_map.get(server_key) or {}).get("tools")
+        for (res, raw_tool), d in _tool_defs.items():
+            if res != resource_key:
+                continue
+            wire_clean = _join_name(server_key, raw_tool)  # server_key__tool
+            # per-server allowlist (the server's own `tools:` list)
+            if per_server_allow is not None and raw_tool not in per_server_allow:
+                continue
+            # context-level allowlist (`tools:` on this context block)
+            if allow is not None and not _allowed(wire_clean, allow):
+                continue
+            namespaced = copy.deepcopy(d)  # never mutate the module registry
+            namespaced["function"]["name"] = bridge_native.apply_namespace(wire_clean)
+            if namespaced["function"]["name"] not in existing:
+                to_add.append(namespaced)
+                existing.add(namespaced["function"]["name"])
+
+    if to_add:
+        ctx.request.tools.extend(to_add)
+        logger.info(
+            f"mcp_client: injected {len(to_add)} tool(s) on identity "
+            f"'{ctx.identity.key}': {[d['function']['name'] for d in to_add]}"
+        )
+    return ctx
+
+
+def _allowed(clean_name: str, allow: list) -> bool:
+    """An allowlist entry may be the full ``server__tool`` name or the bare
+    tool name."""
+    if clean_name in allow:
+        return True
+    split = _split_name(clean_name)
+    return bool(split and split[1] in allow)
+
+
+# ---------------------------------------------------------------------------
+# handle_tool_calls — route to the right MCP server and execute (D-008)
+# ---------------------------------------------------------------------------
+
+async def handle_tool_calls(ctx: "PipelineCtx", config: dict) -> str:
+    """Execute a claimed MCP tool call. The claimed call's ``function.name`` has
+    already had ``bridge_native__`` stripped by core, so it's ``server__tool``.
+    We split off the server_key, route to that server's resource, and call the
+    real MCP tool (fresh connection per call). Known-bad inputs return an error
+    string; genuine MCP/network failures propagate to the executor's synthetic
+    tool-error path so the buddy narrates the failure."""
+    tc = ctx.plugin_data.get("handle_tool_calls.claimed")
+    if not isinstance(tc, dict):
+        return "[mcp_client error: no claimed tool_call on ctx.plugin_data]"
+
+    name = tc.get("function", {}).get("name")
+    split = _split_name(name)
+    if split is None:
+        return f"[mcp_client error: tool name '{name}' has no server sub-namespace]"
+    server_key, raw_tool = split
+
+    # Per-role server gate (security): discovery + routes are GLOBAL and
+    # resource-keyed, so refuse to dispatch a call to a server THIS role didn't
+    # configure — even if the call arrived from history or a crafted request.
+    # Resolving server_key→resource here ALSO routes to the role's OWN resource:
+    # two roles' same-named 'filesystem' servers each hit their own endpoint.
+    server_to_resource = _role_server_to_resource(ctx)
+    resource_key = server_to_resource.get(server_key)
+    if resource_key is None:
+        logger.warning(
+            f"mcp_client: identity '{ctx.identity.key}' tried to call '{name}' "
+            f"but its role does not configure server '{server_key}' — refused."
+        )
+        return (
+            f"[mcp_client error: tool '{name}' is not available to this identity "
+            f"(server '{server_key}' not configured for this role)]"
+        )
+
+    route = _tool_routes.get((resource_key, raw_tool))
+    if route is None:
+        return (
+            f"[mcp_client error: no route for '{name}' → resource "
+            f"'{resource_key}' (tool '{raw_tool}') — the resource may have been "
+            f"down at startup discovery]"
+        )
+    conn, raw_tool_name = route
+
+    raw_args = tc.get("function", {}).get("arguments") or "{}"
+    try:
+        args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+    except (json.JSONDecodeError, ValueError):
+        return f"[mcp_client error: could not parse arguments for '{name}']"
+    if not isinstance(args, dict):
+        args = {}
+
+    result = await _call_tool(conn, raw_tool_name, args)
+    result_text = _stringify(result)
+    logger.info(
+        f"mcp_client: executed '{name}' on identity '{ctx.identity.key}' "
+        f"→ '{result_text[:80]}{'...' if len(result_text) > 80 else ''}'"
+    )
+    return result_text
