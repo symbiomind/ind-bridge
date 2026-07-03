@@ -31,8 +31,10 @@ logic.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import os
 from typing import Any, AsyncIterator, Callable
 
 import httpx
@@ -44,6 +46,14 @@ logger = logging.getLogger(__name__)
 
 # SSE framing (mirror frame_emit / stream_reconstruct constants).
 _DONE_LINE = b"data: [DONE]\n\n"
+
+# Keepalive heartbeat interval (seconds) during a bridge tool pause. A slow tool
+# (docker cold-start ~20s) must not let the client/proxy read-timeout on a silent
+# gap. Overridable via env for tuning against a specific client's timeout.
+try:
+    _KEEPALIVE_INTERVAL_S = float(os.getenv("BRIDGE_STREAM_KEEPALIVE_S", "5"))
+except (TypeError, ValueError):
+    _KEEPALIVE_INTERVAL_S = 5.0
 
 
 # Client-facing delta keys we relay LIVE during a lap. ``content`` is the
@@ -238,19 +248,15 @@ async def stream_with_intercepts(
 
     async def generator() -> AsyncIterator[bytes]:
         lap = 0
-        # Clients render reasoning ONCE per message (reasoning* → content*), not
-        # resumed after content. A multi-lap turn is really reason→talk→tool→
-        # reason→reply, so relaying every lap's reasoning makes LibreChat fold
-        # later content into the reasoning box (content bleed, broken lines). We
-        # stream reasoning live only UNTIL the first content delta of the WHOLE
-        # turn; after that, reasoning is captured/stored internally but not sent
-        # to the glass. One clean reasoning block at the top, then narration —
-        # matching what a raw OpenRouter connection looks like in the client.
-        content_started = False
-        # tidy_reasoning_whitespace quirk: collapse Kimi's stray reasoning
-        # newlines in the LIVE relay too (storage is tidied separately by
-        # quirks_mode.observe_response), so client + stored agree.
-        tidy_reasoning = _tidy_reasoning_active(ctx, pipeline)
+        # TRANSPARENT PIPE: this generator now forwards the upstream stream to the
+        # client VERBATIM (content, reasoning, reasoning_details, harness tool_calls)
+        # and only swallows a BRIDGE-NATIVE tool_call (+ the upstream per-lap [DONE]).
+        # The old re-mint machinery (_iter_client_deltas / _should_relay /
+        # content_started gate / _tidy_reasoning_delta live-tidy) is no longer on the
+        # hot path — raw passthrough carries the provider's own bytes, so there is
+        # nothing to re-frame or tidy (storage-side tidy, if wired, is separate). The
+        # helper functions remain (still unit-tested; used by the assembled-frame
+        # fallback lineage) but the live relay does not call them.
         client = httpx.AsyncClient()
         try:
             while True:
@@ -259,7 +265,17 @@ async def stream_with_intercepts(
                 client.timeout = httpx.Timeout(timeout)
 
                 lap_chunks: list[bytes] = []
-                # ── stream this lap: forward content, stash everything ──────
+                # ── stream this lap: TRANSPARENT PASSTHROUGH ────────────────
+                # The bridge is a transparent pipe: forward the upstream stream
+                # to the client VERBATIM (content, reasoning, reasoning_details,
+                # harness tool_calls — everything) and touch nothing. Only a
+                # BRIDGE-NATIVE tool_call breaks transparency (Stage 2 tripwire:
+                # swallow it + pause). We work at whole-SSE-LINE granularity —
+                # byte-perfect forward per line, but a complete line so the peek
+                # (Stage 2) sees whole `data: {...}` events, never a mid-JSON
+                # slice (the aiter_bytes-split corruption, proven 2026-06-23).
+                # `lap_chunks` tees the same whole lines for reconstruction
+                # (storage) — identical framing to what the client received.
                 async with client.stream("POST", url, json=body, headers=headers) as up:
                     if up.status_code >= 400:
                         err_body = await up.aread()
@@ -274,28 +290,44 @@ async def stream_with_intercepts(
                         )
                         yield _DONE_LINE
                         return
-                    # Iterate by LINE, not raw bytes. ``aiter_bytes`` yields
-                    # arbitrary byte slices that split SSE events mid-JSON;
-                    # parsing those per-slice drops/mangles the split event
-                    # (root cause of the per-word newline + duplication in stored
-                    # reasoning — proven via a raw-OpenRouter curl, 2026-06-23).
-                    # ``aiter_lines`` reassembles complete lines for us, so each
-                    # ``data: {...}`` event is whole before we parse it.
-                    async for line in up.aiter_lines():
-                        if not line:
-                            continue
-                        chunk = (line + "\n").encode("utf-8")
-                        lap_chunks.append(chunk)
-                        for delta in _iter_client_deltas(chunk):
-                            if not _should_relay(delta, content_started):
+                    # `swallowing` trips the instant a BRIDGE-NATIVE tool_call
+                    # line appears; from then on this lap's lines are buffered
+                    # silently (tee'd for reconstruction) but NOT forwarded — so no
+                    # bridge_native__ token leaks and the client sees a pause (the
+                    # tool runs, then the next lap streams). Content/reasoning and
+                    # HARNESS tool_calls before the trip already streamed verbatim.
+                    swallowing = False
+                    sse_buf = b""
+                    async for raw in up.aiter_bytes():
+                        sse_buf += raw
+                        # Split into COMPLETE lines; keep the trailing partial in
+                        # sse_buf until its newline arrives (whole-event invariant).
+                        while b"\n" in sse_buf:
+                            line, sse_buf = sse_buf.split(b"\n", 1)
+                            line_bytes = line + b"\n"
+                            lap_chunks.append(line_bytes)  # tee for reconstruction
+                            if swallowing:
+                                continue  # already tripped — buffer silently
+                            # THE TRIPWIRE: inspect BEFORE forwarding. A bridge-
+                            # native tool_call line is swallowed (and everything
+                            # after it this lap) — never yielded.
+                            if _line_has_bridge_native_toolcall(line_bytes):
+                                swallowing = True
                                 continue
-                            if "content" in delta:
-                                content_started = True
-                            elif tidy_reasoning:
-                                delta = _tidy_reasoning_delta(delta)
-                                if delta is None:
-                                    continue  # newline-only reasoning token — drop
-                            yield _client_chunk(delta, model)
+                            # Swallow the UPSTREAM's own `[DONE]` — this generator
+                            # owns the single stitched terminal/DONE for the WHOLE
+                            # turn (a turn may span multiple laps; an upstream
+                            # per-lap [DONE] must not leak mid-turn). Everything
+                            # else forwards VERBATIM.
+                            if _is_done_line(line_bytes):
+                                continue
+                            yield line_bytes
+                    # Flush any trailing partial (rare; upstream usually ends on \n).
+                    if sse_buf:
+                        lap_chunks.append(sse_buf)
+                        if not swallowing and not _is_done_line(sse_buf) \
+                                and not _line_has_bridge_native_toolcall(sse_buf):
+                            yield sse_buf
 
                 # ── lap closed: reconstruct the assembled frame ─────────────
                 recon = stream_reconstruct.reconstruct_from_chunks(lap_chunks)
@@ -308,9 +340,27 @@ async def stream_with_intercepts(
                 finish_reason = recon.get("finish_reason")
                 tool_calls = recon.get("tool_calls") or []
 
-                # No tool_calls → this lap is the final text turn. Close out.
-                if finish_reason != "tool_calls" or not tool_calls:
-                    yield _terminal_chunk(finish_reason or "stop", model)
+                # TRANSPARENT CLOSE: if we swallowed NOTHING this lap, the whole
+                # lap already streamed to the client verbatim — content, reasoning,
+                # AND any HARNESS tool_calls + the upstream's finish_reason. There
+                # is nothing to intercept (no bridge-native call tripped the wire),
+                # so we just emit the single stitched [DONE] and return. This is the
+                # common path (pure text OR harness-tool turns): the bridge is a
+                # clean pipe, the reconstruction/claim/intercept machinery below is
+                # reached ONLY when a bridge-native call was swallowed. (Guard: if
+                # the upstream never sent a finish_reason chunk — rare drift —
+                # synthesise one so the client still gets a clean close.)
+                if not swallowing:
+                    if not _lap_forwarded_finish_reason(lap_chunks):
+                        yield _terminal_chunk(finish_reason or "stop", model)
+                    yield _DONE_LINE
+                    ctx.plugin_data["stream_intercept.closed"] = True
+                    return
+
+                # We swallowed a bridge-native tool_call this lap. If reconstruction
+                # somehow found no tool_calls (defensive — shouldn't happen after a
+                # trip), close cleanly rather than loop forever.
+                if not tool_calls:
                     yield _DONE_LINE
                     ctx.plugin_data["stream_intercept.closed"] = True
                     return
@@ -357,13 +407,36 @@ async def stream_with_intercepts(
                     return
 
                 # ── execute claimed tools (THE PAUSE), splice, loop ─────────
+                # The tool run can be SLOW (a docker cold-start ~20s). We swallowed
+                # the bridge-native call, so nothing is streaming — a silent gap
+                # this long risks a client/proxy read-timeout. Run the tools as a
+                # background task and emit a KEEPALIVE heartbeat every
+                # _KEEPALIVE_INTERVAL_S until it completes. The heartbeat is an
+                # empty-delta chunk (no content/reasoning) — every OpenAI client
+                # accepts it silently; it injects nothing into the render, just
+                # keeps the connection warm. (If the model streamed preamble content
+                # before the call, that already served as keepalive; this covers the
+                # no-preamble case.)
                 assistant_turn = build_assistant_turn(ctx)
-                tool_result_messages: list[dict] = []
-                for plugin, plugin_config, slot, claimed in plugin_claims:
-                    results = await run_intercept_plugin(
-                        plugin, plugin_config, ctx, slot, claimed,
-                    )
-                    tool_result_messages.extend(results)
+
+                async def _run_all_claimed() -> list[dict]:
+                    out: list[dict] = []
+                    for plugin, plugin_config, slot, claimed in plugin_claims:
+                        results = await run_intercept_plugin(
+                            plugin, plugin_config, ctx, slot, claimed,
+                        )
+                        out.extend(results)
+                    return out
+
+                tool_task = asyncio.ensure_future(_run_all_claimed())
+                while not tool_task.done():
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(tool_task), timeout=_KEEPALIVE_INTERVAL_S
+                        )
+                    except asyncio.TimeoutError:
+                        yield _keepalive_chunk(model)  # heartbeat; loop again
+                tool_result_messages: list[dict] = tool_task.result()
 
                 ctx.request.messages = [
                     *ctx.request.messages,
@@ -395,6 +468,86 @@ async def stream_with_intercepts(
                     )
 
     return generator
+
+
+def _is_done_line(line: bytes) -> bool:
+    """True if this SSE line is the terminal ``data: [DONE]`` sentinel. We swallow
+    the upstream's per-lap [DONE] on the passthrough path — the generator owns the
+    single stitched [DONE] for the whole (possibly multi-lap) turn."""
+    s = line.strip()
+    return s == b"data: [DONE]" or s == b"[DONE]"
+
+
+def _line_has_bridge_native_toolcall(line: bytes) -> bool:
+    """THE TRIPWIRE. True if this SSE line carries a ``tool_calls`` delta whose
+    ``function.name`` is bridge-native (``bridge_native__*``). The tool name arrives
+    on the FIRST chunk for a tool_call index (per the stream_reconstruct provider
+    contract), so the very first bridge-native tool_call line trips this — and the
+    caller stops forwarding BEFORE yielding it, so no ``bridge_native__`` token ever
+    reaches the client. HARNESS tool_calls (any other name) return False → they pass
+    through verbatim (the harness runs its own loop). Tolerant: a malformed line, a
+    tool_call with no name yet (args-only continuation), or a non-tool line → False."""
+    s = line.strip()
+    if not s.startswith(b"data:"):
+        return False
+    payload = s[len(b"data:"):].strip()
+    if not payload or payload == b"[DONE]":
+        return False
+    try:
+        event = json.loads(payload)
+    except (ValueError, TypeError):
+        return False
+    choices = event.get("choices") or []
+    if not choices or not isinstance(choices[0], dict):
+        return False
+    delta = choices[0].get("delta") or {}
+    tcs = delta.get("tool_calls")
+    if not isinstance(tcs, list):
+        return False
+    for tc in tcs:
+        if not isinstance(tc, dict):
+            continue
+        name = ((tc.get("function") or {}).get("name")) or ""
+        if name and bridge_native.is_namespaced(name):
+            return True
+    return False
+
+
+def _lap_forwarded_finish_reason(lap_chunks: list[bytes]) -> bool:
+    """True if this lap's upstream stream already carried a non-null
+    ``finish_reason`` chunk (which we forwarded VERBATIM). Lets the close path
+    avoid synthesising a duplicate terminal chunk. Tolerant parser: scans the
+    tee'd lines for any ``data:`` event whose choices[0].finish_reason is set."""
+    for line in lap_chunks:
+        s = line.strip()
+        if not s.startswith(b"data:"):
+            continue
+        payload = s[len(b"data:"):].strip()
+        if not payload or payload == b"[DONE]":
+            continue
+        try:
+            event = json.loads(payload)
+        except (ValueError, TypeError):
+            continue
+        choices = event.get("choices") or []
+        if choices and isinstance(choices[0], dict):
+            if choices[0].get("finish_reason"):
+                return True
+    return False
+
+
+def _keepalive_chunk(model: str | None) -> bytes:
+    """An empty-delta heartbeat chunk emitted during a slow bridge-tool pause.
+    Carries no content/reasoning and a null finish_reason — every OpenAI client
+    accepts it silently (it injects nothing into the render), it just keeps the
+    connection from read-timing-out while the tool runs."""
+    payload = {
+        "object": "chat.completion.chunk",
+        "choices": [{"index": 0, "delta": {}, "finish_reason": None}],
+    }
+    if model:
+        payload["model"] = model
+    return f"data: {json.dumps(payload)}\n\n".encode("utf-8")
 
 
 def _terminal_chunk(finish_reason: str, model: str | None) -> bytes:
