@@ -2,8 +2,8 @@
 
 Bridge-owned conversation state. The harness thinks every request is a fresh
 context; **the bridge owns the session entirely** — loading history, rebuilding
-the message list, and saving the turn. This is what moves a buddy into Shape 4
-(session-in-the-bridge): yeet the harness, the buddy is still the buddy.
+the message list, and saving the turn. This is what moves an agent into Shape 4
+(session-in-the-bridge): yeet the harness, the agent is still the agent.
 
 It is also the **authoritative producer of the `session_state` contract** (D-009).
 Because it owns the history file, it *knows* whether a session is fresh — so the
@@ -45,15 +45,30 @@ yet closed); the closing turn is saved when it comes back through.
 A fresh session happens when the file is gone/empty — **deleting the session file is
 the always-available hard reset.** That's the zero-config, zero-surprise baseline.
 
-Opt into a soft boundary with `session_reset`. A soft reset does **not** delete the
-file — it stamps `is_new` (so the wake cascade fires) and starts a fresh send-window;
-nothing stored is lost.
+Opt into a soft boundary with `session_reset`.
 
 | `mode` | Behaviour |
 |---|---|
 | `never` (default) | Fresh only when file empty/missing. |
-| `daily` | Fresh on the first turn after the configured `at:` time (server tz) has rolled past the file's last write. |
+| `daily` | A background scheduler archives the session file at the configured `at:` time (renames it to a dated copy beside the original — nothing is destroyed). The next read takes the empty-file path → fresh. |
 | `manual` | Fresh when the request carries header `x-session-reset: 1` (or `true`/`yes`/`reset`). |
+
+**Why `daily` is event-driven (not read-driven).** It schedules an *archive* at
+the boundary rather than comparing the file's mtime on each read. A read-time
+heuristic is racy: anything that writes the session file mid-day (a `cron`
+heartbeat, a background reflection) bumps the mtime past the boundary and
+silently consumes the reset before the next human turn ever sees it. An archive
+either happened or it didn't — it can't be raced. The reset fires for the
+*human's* first turn of the day, which is the moment the wake cascade should run.
+(Archiving also means the gap is non-destructive: yesterday's session is a dated
+file beside the live one, not gone.)
+
+**Timezone.** The `at:` boundary resolves its clock in this order, most specific
+first: a `timezone:` on the `session_reset` block → an identity-level hint →
+the global `server.timezone` → `UTC`. So a plugin honours `server.timezone` by
+default, but **any session that wants its own clock can set `session_reset.timezone`** —
+the bridge doesn't care why you'd run two sessions on different timezones; it just
+does what the config says.
 
 ## `degrade_tool_history` (opt-in, default off)
 
@@ -67,16 +82,16 @@ single `role: assistant` message carrying paired XML tags:
 <tool type="result" name="get_memory" truncated="harness">…visible bytes…</tool>
 ```
 
-The most-recent closed exchange stays raw, so the buddy can still reason from
+The most-recent closed exchange stays raw, so the agent can still reason from
 fresh tool results. The in-flight harness tool-loop tail (current request)
 always passes through verbatim — the fold operates on the stored window only.
 
 **Why bother:** harnesses (LibreChat especially) can truncate tool results at
 their door before the bridge sees them, leaving `[truncated: N chars exceeded M
 limit]` markers in the content. `basic_session` stores faithfully (it's the
-buddy's real memory of what arrived), and the windowed history is re-sent to
+agent's real memory of what arrived), and the windowed history is re-sent to
 the model each turn. Without the fold, old truncated plumbing accumulates on
-the wire turn-over-turn. With it, the buddy still remembers having used the
+the wire turn-over-turn. With it, the agent still remembers having used the
 tool (the `<tool type="call">` breadcrumb survives), the result content is
 preserved verbatim (truncation marker included, with `truncated="harness"`
 flagging it honestly), but the protocol-shape bloat is gone.
@@ -85,7 +100,7 @@ flagging it honestly), but the protocol-shape bloat is gone.
 
 - The `name=` attribute carries the **bare tool name** from the OpenAI
   `tool_calls` payload, nothing else. NEVER `personal-mcp:get_memory`, NEVER
-  `<tool source="…">`, NEVER any harness/server label. A buddy that survives a
+  `<tool source="…">`, NEVER any harness/server label. An agent that survives a
   LibreChat↔OpenClaw switch must see identical folded prose from both sides.
 - `truncated="harness"` is the **only** hint about lossiness. It applies when
   the result content contains `[truncated:`. Honest without naming names — any
@@ -112,7 +127,8 @@ sessions:
         system_prompt_append: "..."      # optional string appended to whatever system is used
         session_reset:                   # optional; OFF by default
           mode: never                    # never | daily | manual
-          at: "04:00"                    # daily only — boundary in server tz
+          at: "04:00"                    # daily only — boundary time
+          # timezone: America/New_York   # daily only — overrides server.timezone for this session
         degrade_tool_history: false      # opt-in: fold OLD tool exchanges to
                                          # assistant prose on SEND (storage stays full).
                                          # Keeps the most-recent closed exchange raw.

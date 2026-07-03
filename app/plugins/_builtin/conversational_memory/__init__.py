@@ -136,6 +136,7 @@ See README.md for the full why.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -144,7 +145,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from app.context import PipelineCtx
+    from app.context import PipelineCtx, StartupCtx
 
 logger = logging.getLogger(__name__)
 
@@ -152,11 +153,19 @@ logger = logging.getLogger(__name__)
 CAPABILITIES = {
     "context_modify": ["identity.context.plugins", "role.context.plugins"],
     "post_response":  ["identity.context.plugins", "role.context.plugins"],
+    "background":     ["identity.plugins"],
 }
-"""Both capabilities accept the same slots — operator declares the plugin
-once, both methods receive the same config dict. Lifecycle is unchanged:
-post_response still fires after delivery, fire-and-forget; only the
-config-surface unifies. See ind-v4-brainstorm.md spec note."""
+"""context_modify + post_response accept the same context slots — operator declares
+the plugin once, both methods receive the same config dict. Lifecycle unchanged:
+post_response still fires after delivery, fire-and-forget.
+
+`background` is the LABEL-ENRICHMENT daemon (one catch-up loop per registered memory
+store). It is SERVER-SCOPED, not per-identity: it spawns from the
+``server.plugins.conversational_memory`` registry (see start_background / the
+_SERVER_SCOPE guard), NOT from any buddy's context.plugins.conversational_memory
+block. The per-identity spawn walk still discovers `background` here (conv_mem is
+context-homed), but start_background returns None for those calls — only the one
+server-scope call spawns. See ind-v4-brainstorm.md + the enrichment section below."""
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +186,56 @@ first modify_context / observe_response call per resource. V4 has no
 server.startup capability so we resolve when first asked."""
 
 
+# --- LABEL ENRICHMENT (background daemon) -----------------------------------
+#
+# The "last missing component" of V4 conv_mem. A worker ROLE (e.g. label_llm)
+# assigns reusable labels to memories stored with the nonce marker, turning them
+# from unenriched (nonce-only) into semantically labelled — which lights up L2
+# trending recall. THE MODEL: enrichment is "a role doing a task", fired in-process
+# via pipeline_executor.execute() through the worker's neutral internal carrier
+# (the same mechanism bridge_messaging uses to deliver agent→agent). No fake chat
+# identity, no separate plugin — code lives HERE, in conv_mem.
+
+_SERVER_SCOPE = "__server__"
+"""Sentinel identity_key the server passes to start_background for the ONE
+server-scoped enrichment spawn. A per-identity start_background call (conv_mem is
+context-homed, so the per-identity walk discovers `background` on every buddy) gets
+a real identity_key and returns None — only this sentinel spawns the loops."""
+
+# Adaptive catch-up interval thresholds (seconds) — ported from V3 / memory_enricher.
+_ENRICH_INTERVAL_HIGH   =  15   # remaining > 100
+_ENRICH_INTERVAL_MEDIUM =  60   # remaining > 10
+_ENRICH_INTERVAL_LOW    = 300   # remaining > 0
+_ENRICH_INTERVAL_IDLE   = 900   # backlog drained
+_ENRICH_WARMUP_DELAY    =  60   # let the bridge settle before first tick
+
+# Default labels system prompt — used when the worker role has no system_prompt of
+# its own (e.g. no LABELS.md). Ported from V3 (enrichment.ts SYSTEM_PROMPT).
+_ENRICH_SYSTEM_PROMPT = (
+    "You are a memory categorization system. Your job is to assign reusable topic "
+    "category labels to conversation excerpts."
+    "\n\n"
+    "Output ONLY a comma-separated list of 4-6 labels. Rules:"
+    "\n- lowercase, hyphenated, no spaces"
+    "\n- REUSABLE: labels must be broad enough to apply to many different conversations"
+    "\n- CATEGORICAL: use topic categories, not descriptions of specific events"
+    "\n- no explanation, no newlines, no punctuation except commas"
+    "\n\n"
+    "Good examples: plugin-dev,memory-system,configuration,bug-fix,session-management,api-integration"
+    "\n"
+    "Bad examples: hype-induced-reset,mistress-priority-delay,test-secret-filter-canary (too specific/unique)"
+)
+
+_TASK_LABEL_ENRICHMENT = "label_enrichment"
+"""The task name a worker role lists in conversational_memory.tasks to opt into
+being the label-enrichment worker."""
+
+# Per-store nudge flags — set True by observe_response after a successful store so
+# the matching catch-up loop wakes immediately instead of waiting for its poll.
+# Keyed by memory-store resource_key.
+_enrich_nudge: dict[str, bool] = {}
+
+
 _BRIDGE_CONTEXT_RE = re.compile(
     r'^<bridge_context\b[^>]*>.*?</bridge_context>\s*',
     re.DOTALL,
@@ -184,6 +243,39 @@ _BRIDGE_CONTEXT_RE = re.compile(
 """Strip an injected <bridge_context> block from the start of a user message
 before storing — we don't want the bridge's own context becoming part of
 the stored conversation pair. Same regex as V3."""
+
+
+# Match storage="false" (single or double quotes) as an attribute on the OPENING
+# <bridge_context> tag. storage is a TURN-handling marker (a bridge/envelope
+# property), so it lives on <bridge_context> itself — not on the <caller>
+# identity tag. Scoped to the opening tag (`[^>]*` stays before the first `>`) so
+# an unsigned storage="false" in arbitrary user prose can't trip it — the marker
+# is only honoured where the bridge signed it (the signature folds storage in;
+# see bridge_sign._hmac). bridge_messaging stamps this for ephemeral turns.
+_STORAGE_FALSE_RE = re.compile(
+    r'<bridge_context\b[^>]*\bstorage\s*=\s*["\']false["\'][^>]*>',
+    re.IGNORECASE,
+)
+
+
+def _inbound_storage_suppressed(messages: list[dict]) -> bool:
+    """True if the last user turn carries a signed storage="false" marker — the
+    caller asked for this pair to be ephemeral (recalled-but-not-stored). Reads
+    the working-copy user turn (where assemble_and_sign prepended the signed
+    <bridge_context>). Defensive: any non-string / missing content is False."""
+    for msg in reversed(messages or []):
+        if not isinstance(msg, dict) or msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        if isinstance(content, list):  # multi-part — flatten text parts
+            content = " ".join(
+                p.get("text", "") for p in content
+                if isinstance(p, dict) and p.get("type") == "text"
+            )
+        if not isinstance(content, str):
+            return False
+        return bool(_STORAGE_FALSE_RE.search(content))
+    return False
 
 
 _HOUSEKEEPING_END_RE = re.compile(
@@ -266,6 +358,12 @@ async def modify_context(ctx: "PipelineCtx", config: dict) -> "PipelineCtx":
     a single failing cascade layer) is logged and skipped — the request
     continues with whatever memories survived rather than 500ing the user.
     """
+    # TASK-ONLY worker gate: a role whose conv_mem declares tasks: (e.g. the
+    # label_enrichment worker) is NOT a conversant — it must not recall memories
+    # into its own labelling turn. No L3→L1 cascade for a worker.
+    if config.get("tasks"):
+        return ctx
+
     resource_key = config.get("resource")
     if not resource_key:
         logger.warning("conversational_memory: 'resource' is required in config; skipping recall")
@@ -358,7 +456,7 @@ async def modify_context(ctx: "PipelineCtx", config: dict) -> "PipelineCtx":
     trending_count = int(wakeup_cfg.get("trending_count", 5))
 
     # L3 recency ALWAYS locks to the agent's own source — never the recall_source
-    # filter, never a wildcard. "How we left off" is by definition this buddy's
+    # filter, never a wildcard. "How we left off" is by definition this agent's
     # own last session, not a shared pool.
     l3_source = _default_source(agent_alias, ctx.resource.key)
 
@@ -507,8 +605,30 @@ async def observe_response(ctx: "PipelineCtx", config: dict) -> None:
     Honours config["store"] (default True) — operators can opt an identity
     out of storing while keeping recall.
     """
+    # TASK-ONLY worker gate: a role whose conv_mem declares tasks: is a worker, not
+    # a conversant — its labelling turns must NOT be stored as memories (that would
+    # pollute the store and feed the enricher its own output). No auto-store.
+    if config.get("tasks"):
+        return
+
     if not config.get("store", True):
         logger.debug("conversational_memory: store=false — skipping storage")
+        return
+
+    # Signed ephemeral-turn marker. A bridge_messaging caller can stamp
+    # storage="false" into its signed <caller> to mark this user/agent pair
+    # EPHEMERAL — "any plugin that persists the pair should leave it alone."
+    # We still recalled normally this turn (modify_context already fired); we
+    # only skip the STORE. The flag rides in the signed <bridge_context> on the
+    # inbound user turn, so reading it is tamper-proof (forging it requires the
+    # signing secret). The dreamer uses this so a dream colours the morning but
+    # fades from recall — basic_session still keeps it (the session is the
+    # conversation), only conv_mem forgets it. See bridge_messaging plugin.
+    if _inbound_storage_suppressed(ctx.request.messages):
+        logger.info(
+            "conversational_memory: inbound caller set storage=\"false\" "
+            "(ephemeral turn) — recalled but skipping store"
+        )
         return
 
     resource_key = config.get("resource")
@@ -622,6 +742,13 @@ async def observe_response(ctx: "PipelineCtx", config: dict) -> None:
     logger.info(
         f"conversational_memory: stored memory id={memory_id} source='{source}'"
     )
+
+    # STORE-SIDE NUDGE: a fresh memory landed in `resource_key` carrying the nonce
+    # marker. If a label-enrichment loop watches this store, wake it so the memory
+    # gets labelled within ~15s instead of waiting for the adaptive poll. Just a
+    # flag — the loop owns the store; this never blocks or fails the store path.
+    if resource_key in _enrich_nudge:
+        _enrich_nudge[resource_key] = True
 
     # Mark the freshly stored memory as shown so it isn't re-injected next turn.
     try:
@@ -784,6 +911,334 @@ def _parse_tool_result(result) -> list | dict:
     except Exception as e:
         logger.warning(f"conversational_memory: _parse_tool_result failed — {e}")
     return []
+
+
+# ===========================================================================
+# LABEL ENRICHMENT — background daemon ("a role doing a task")
+# ===========================================================================
+#
+# start_background (server-scoped) reads the server registry, resolves each
+# worker's memory store, and spawns ONE catch-up loop per store. observe_response
+# nudges the matching loop after a fresh store. Each unenriched memory is labelled
+# by firing the worker ROLE in-process via execute() (Path B) — through the
+# worker's neutral internal carrier — then replace_labels swaps the nonce for the
+# real labels.
+
+def start_background(ctx: "StartupCtx", config: dict):
+    """Spawn the label-enrichment catch-up loops — ONE per registered memory store.
+
+    Server-scoped: only the single ``__server__`` call (from _spawn_background_tasks'
+    server-registry pass) spawns. Per-identity calls (conv_mem is context-homed, so
+    the per-identity walk discovers this `background` capability on every buddy)
+    return None — enrichment is not per-buddy.
+
+    Reads ``server.plugins.conversational_memory`` (the registry) from ctx.server_cfg,
+    builds the store→worker index, and returns a single supervising coroutine that
+    runs all per-store loops concurrently. DLC-grace: no registry / no resolvable
+    worker → return None, nothing spawns."""
+    if ctx.identity_key != _SERVER_SCOPE:
+        return None  # per-identity discovery — enrichment is server-scoped, not per-buddy.
+
+    index = _build_enrichment_index(ctx.server_cfg)
+    if not index:
+        logger.info(
+            "conversational_memory: no label-enrichment workers configured "
+            "(server.plugins.conversational_memory) — L2 trending stays dark."
+        )
+        return None
+
+    loops = []
+    for store_key, worker in index.items():
+        conn = _get_connection(store_key)
+        if conn is None:
+            logger.error(
+                f"conversational_memory: enrichment store '{store_key}' unresolved "
+                f"— worker '{worker['role']}' will not run."
+            )
+            continue
+        logger.info(
+            f"conversational_memory: label-enrichment loop for store '{store_key}' "
+            f"→ worker role '{worker['role']}' (nonce={worker['nonce']}, "
+            f"batch_size={worker['batch_size']})."
+        )
+        loops.append(_enrichment_loop(store_key, conn, worker))
+
+    if not loops:
+        return None
+    return _run_enrichment_loops(loops)
+
+
+async def _run_enrichment_loops(loops: list) -> None:
+    """Supervise all per-store loops concurrently under one spawned task."""
+    await asyncio.gather(*loops)
+
+
+def _build_enrichment_index(server_cfg: dict) -> dict[str, dict]:
+    """Read the server registry and build a store_resource_key → worker-info map.
+
+    Registry shape (server.plugins.conversational_memory):
+        name_a: { role: label_llm, batch_size: 1, nonce: <optional> }
+        name_b: {}                                   # placeholder, skipped
+
+    For each entry that names a ``role``, resolve that worker role's own
+    conversational_memory block: its ``resource`` is the memory store it enriches
+    (the trigger-match key), and its ``tasks`` must include ``label_enrichment``.
+    Returns {} on an absent/empty registry (DLC-grace)."""
+    from app import config as app_config
+
+    registry = ((server_cfg.get("plugins") or {}).get("conversational_memory")) or {}
+    if not isinstance(registry, dict):
+        return {}
+
+    index: dict[str, dict] = {}
+    for entry_name, entry in registry.items():
+        if not isinstance(entry, dict) or not entry.get("role"):
+            continue  # {} placeholder or malformed — skip (DLC-grace).
+        worker_role = entry["role"]
+        role_cfg = app_config.resolve_role(worker_role) or {}
+        cm = _role_conv_mem_cfg(role_cfg)
+        if cm is None:
+            logger.warning(
+                f"conversational_memory: enrichment entry '{entry_name}' names role "
+                f"'{worker_role}' but that role has no conversational_memory block — skipping."
+            )
+            continue
+        tasks = cm.get("tasks") or []
+        if _TASK_LABEL_ENRICHMENT not in tasks:
+            logger.warning(
+                f"conversational_memory: worker role '{worker_role}' does not list "
+                f"'{_TASK_LABEL_ENRICHMENT}' in conversational_memory.tasks — skipping."
+            )
+            continue
+        store_key = cm.get("resource")
+        if not store_key:
+            logger.warning(
+                f"conversational_memory: worker role '{worker_role}' has no "
+                f"conversational_memory.resource (the store to enrich) — skipping."
+            )
+            continue
+        # nonce: registry entry wins, else the worker's own cm block, else default.
+        nonce = str(entry.get("nonce") or cm.get("nonce") or _DEFAULT_NONCE)
+        batch_size = int(entry.get("batch_size", 1))
+        if store_key in index:
+            logger.warning(
+                f"conversational_memory: store '{store_key}' already has an enrichment "
+                f"worker ('{index[store_key]['role']}') — ignoring duplicate '{worker_role}'."
+            )
+            continue
+        index[store_key] = {
+            "role": worker_role,
+            "nonce": nonce,
+            "batch_size": batch_size,
+        }
+    return index
+
+
+def _role_conv_mem_cfg(role_cfg: dict) -> dict | None:
+    """Pull the conversational_memory block from a role config (context-first,
+    then legacy top-level). Returns None if absent or a disable-tombstone."""
+    ctx_plugins = (role_cfg.get("context") or {}).get("plugins") or {}
+    cm = ctx_plugins.get("conversational_memory")
+    if not isinstance(cm, dict):
+        cm = (role_cfg.get("plugins") or {}).get("conversational_memory")
+    return cm if isinstance(cm, dict) else None
+
+
+async def _enrichment_loop(store_key: str, conn: dict, worker: dict) -> None:
+    """Catch-up loop for ONE memory store — adaptive polling, nudge-woken.
+    Ported in shape from V3 / memory_enricher, but each memory is enriched by
+    firing the worker ROLE via execute() (Path B), not a bare LLM call."""
+    nonce = worker["nonce"]
+    batch_size = worker["batch_size"]
+    worker_role = worker["role"]
+
+    # Register this store so observe_response's store-side nudge can wake us.
+    _enrich_nudge.setdefault(store_key, False)
+
+    logger.info(
+        f"conversational_memory: enrichment loop '{store_key}' — warmup "
+        f"{_ENRICH_WARMUP_DELAY}s"
+    )
+    await asyncio.sleep(_ENRICH_WARMUP_DELAY)
+
+    while True:
+        if _enrich_nudge.get(store_key):
+            _enrich_nudge[store_key] = False
+            logger.debug(f"conversational_memory: enrichment '{store_key}' nudged")
+
+        processed = 0
+        remaining = 0
+        try:
+            batch = await _retrieve_unenriched(conn, nonce, batch_size)
+            for mem in batch:
+                mem_id = mem.get("id")
+                content = mem.get("content", "")
+                if not mem_id or not content:
+                    continue
+                labels = await _enrich_one(worker_role, content)
+                if labels:
+                    await _replace_labels(conn, mem_id, nonce, labels)
+                    logger.info(f"conversational_memory: enriched #{mem_id} → {labels}")
+                    processed += 1
+                else:
+                    logger.warning(
+                        f"conversational_memory: #{mem_id} — no labels generated, "
+                        f"stays nonce-marked (retried next tick)."
+                    )
+            remaining = await _get_remaining_count(conn, nonce)
+        except asyncio.CancelledError:
+            logger.info(f"conversational_memory: enrichment loop '{store_key}' cancelled")
+            raise
+        except Exception as e:
+            logger.error(
+                f"conversational_memory: enrichment tick error '{store_key}' — {e}",
+                exc_info=True,
+            )
+
+        interval = _enrich_interval(remaining)
+        if processed or remaining:
+            logger.info(
+                f"conversational_memory: enrichment '{store_key}' processed={processed} "
+                f"remaining={remaining} next_tick={interval}s"
+            )
+        await asyncio.sleep(interval)
+
+
+def _enrich_interval(remaining: int) -> int:
+    if remaining > 100:
+        return _ENRICH_INTERVAL_HIGH
+    if remaining > 10:
+        return _ENRICH_INTERVAL_MEDIUM
+    if remaining > 0:
+        return _ENRICH_INTERVAL_LOW
+    return _ENRICH_INTERVAL_IDLE
+
+
+async def _enrich_one(worker_role: str, content: str) -> str | None:
+    """Label ONE memory by firing the worker role in-process via execute() (Path B).
+
+    Fires the worker's NEUTRAL internal carrier (minted for tasks: roles by
+    config._synthesize_internal_carriers) so the real pipeline runs — the worker's
+    system_prompt (LABELS.md) shapes the turn, and its tasks: gate suppresses its own
+    recall/store. Retries once on unparseable output. Returns a clean comma-separated
+    label string, or None below the quality bar."""
+    from app import config as app_config
+    from app import pipeline_executor
+
+    carrier = f"{app_config.INTERNAL_CARRIER_PREFIX}{worker_role}"
+    body = {
+        "messages": [{"role": "user", "content": f"Label this conversation:\n\n{content}"}],
+        "stream": False,
+        # A task turn gets no tools — the worker replies with labels, doesn't act.
+        "_bridge_no_tools": True,
+    }
+    for attempt in (1, 2):
+        try:
+            resp = await pipeline_executor.execute(carrier, body, {})
+            raw = _extract_worker_text(resp)
+            labels = _parse_labels(raw or "")
+            if labels:
+                return labels
+            logger.warning(
+                f"conversational_memory: enrich attempt {attempt} via '{worker_role}' "
+                f"— bad label output: '{(raw or '')[:80]}'"
+            )
+        except Exception as e:
+            logger.warning(
+                f"conversational_memory: enrich attempt {attempt} via '{worker_role}' "
+                f"— error: {e}"
+            )
+    return None
+
+
+def _extract_worker_text(resp) -> str | None:
+    """Pull assistant text from execute()'s return. Non-stream execute() returns
+    {"role","content","_full_response"}; also tolerate a bare upstream
+    {"choices":[{"message":{"content"}}]}. A StreamingResponse (no .get) → None."""
+    if not isinstance(resp, dict):
+        return None
+    content = resp.get("content")
+    if isinstance(content, str) and content.strip():
+        return content.strip()
+    for choices in (
+        ((resp.get("_full_response") or {}).get("choices")),
+        resp.get("choices"),
+    ):
+        if isinstance(choices, list) and choices:
+            c = ((choices[0] or {}).get("message") or {}).get("content")
+            if isinstance(c, str) and c.strip():
+                return c.strip()
+    return None
+
+
+def _parse_labels(raw: str) -> str | None:
+    """Parse + validate raw LLM output into a clean comma-separated label string.
+    Splits on any delimiter, strips punctuation noise, validates format, requires
+    ≥4 tokens, returns first 6 joined by comma. None if below the quality bar
+    (triggers a retry). Ported verbatim from V3 / memory_enricher."""
+    tokens = [
+        re.sub(r"[!.]", "", t).lower().strip()
+        for t in re.split(r"[,\s]+", raw)
+    ]
+    valid = [t for t in tokens if re.fullmatch(r"[a-z][a-z0-9\-]{2,}", t)]
+    if len(valid) < 4:
+        return None
+    return ",".join(valid[:6])
+
+
+# --- enrichment MCP calls (ported from V3 / memory_enricher) ----------------
+
+async def _retrieve_unenriched(conn: dict, nonce: str, num_results: int) -> list:
+    """Fetch a batch of unenriched memories (labelled with nonce only)."""
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamablehttp_client
+
+    url = conn["endpoint_url"]
+    headers = {"Authorization": f"Bearer {conn['token']}"} if conn["token"] else {}
+    async with streamablehttp_client(url, headers=headers) as (read, write, _):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            result = await session.call_tool(
+                "retrieve_memories",
+                arguments={"labels": nonce, "num_results": num_results},
+            )
+            parsed = _parse_tool_result(result)
+            if isinstance(parsed, dict):
+                return parsed.get("memories", [])
+            return parsed if isinstance(parsed, list) else []
+
+
+async def _replace_labels(conn: dict, memory_id, nonce: str, new_labels: str) -> None:
+    """Atomically swap the nonce label for real semantic labels."""
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamablehttp_client
+
+    url = conn["endpoint_url"]
+    headers = {"Authorization": f"Bearer {conn['token']}"} if conn["token"] else {}
+    async with streamablehttp_client(url, headers=headers) as (read, write, _):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            await session.call_tool(
+                "replace_labels",
+                arguments={"memory_id": memory_id, "target": nonce, "new": new_labels},
+            )
+
+
+async def _get_remaining_count(conn: dict, nonce: str) -> int:
+    """Count memories still carrying the nonce label (backlog size)."""
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamablehttp_client
+
+    url = conn["endpoint_url"]
+    headers = {"Authorization": f"Bearer {conn['token']}"} if conn["token"] else {}
+    async with streamablehttp_client(url, headers=headers) as (read, write, _):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            result = await session.call_tool("memory_stats", arguments={"labels": nonce})
+            parsed = _parse_tool_result(result)
+            if isinstance(parsed, dict):
+                return int(parsed.get("matching", 0))
+            return 0
 
 
 # ---------------------------------------------------------------------------
@@ -995,7 +1450,7 @@ def _load_shown(data_dir: str, state_key: str, decay_minutes) -> dict[str, dict]
     split is groundwork for a future bridge-owned-session reconcile; it carries
     no behaviour today (recall vs store both just dedup). The history-reconcile
     idea was removed because the bridge can't see recalled blocks round-trip
-    from a *client*-owned session — see project_conv_mem_provenance_reconcile.
+    from a *client*-owned session.
 
     Both legacy on-disk shapes auto-upgrade in memory (no on-disk migration):
       - flat list           ["1", "2"]            → epoch ts, origin="recalled"

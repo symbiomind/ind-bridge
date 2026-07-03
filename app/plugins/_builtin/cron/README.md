@@ -23,7 +23,7 @@ identities:
           time: "0 3 * * *"      # standard 5-field cron expression
           prompt_text: "You are calling yourself — reflect on your day."
           # prompt_file: /path/to/prompt.md   # alternative to prompt_text
-          # timezone: Australia/Adelaide       # optional; else identity tz / UTC
+          # timezone: America/New_York         # optional; else identity tz / UTC
           # model: anthropic/claude-opus-4.8   # optional; else resource default
         morning_hello:
           time: "0 9 * * *"

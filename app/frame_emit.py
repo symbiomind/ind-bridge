@@ -123,11 +123,30 @@ async def emit_frame_as_sse(frame: dict) -> AsyncIterator[bytes]:
     role_delta = {"role": "assistant"}
     yield _format_chunk(base_envelope, delta=role_delta, finish_reason=None)
 
+    # Reasoning — emit whichever key(s) the frame carries (provider key drift:
+    # Moonshot-direct → reasoning_content; OpenRouter → reasoning + structured
+    # reasoning_details). Relay under the original key, never normalise, so the
+    # client sees the agent think on the buffered re-emit path too (parity with
+    # the live stream_intercept path).
     reasoning = msg.get("reasoning_content")
     if isinstance(reasoning, str) and reasoning:
         yield _format_chunk(
             base_envelope,
             delta={"reasoning_content": reasoning},
+            finish_reason=None,
+        )
+    reasoning_alt = msg.get("reasoning")
+    if isinstance(reasoning_alt, str) and reasoning_alt:
+        yield _format_chunk(
+            base_envelope,
+            delta={"reasoning": reasoning_alt},
+            finish_reason=None,
+        )
+    reasoning_details = msg.get("reasoning_details")
+    if isinstance(reasoning_details, list) and reasoning_details:
+        yield _format_chunk(
+            base_envelope,
+            delta={"reasoning_details": reasoning_details},
             finish_reason=None,
         )
 

@@ -9,8 +9,8 @@ provider that needs it. It's the [bridge's switch-harnesses thesis](../../../../
 made concrete: the bridge is the stable layer; any harness + any provider swap underneath,
 and the bridge speaks each one's dialect in the middle.
 
-It is **scoped + opt-in per buddy** — the *opposite* of a core vendor-prefix-soup registry.
-You enable exactly the quirks a model needs, nothing more; a buddy on a tolerant provider
+It is **scoped + opt-in per agent** — the *opposite* of a core vendor-prefix-soup registry.
+You enable exactly the quirks a model needs, nothing more; an agent on a tolerant provider
 gets none. (Browser quirks mode: the legitimate, designed "handle non-compliant input
 gracefully" switch — not a hack.)
 
@@ -41,7 +41,7 @@ quirks_mode:
 ```
 
 - **`model:`** is a key into the shipped [`models.yml`](models.yml) table (model string →
-  quirk list). Use it for known-working setups — any buddy on that model inherits the
+  quirk list). Use it for known-working setups — any agent on that model inherits the
   proven recipe.
 - **`quirks:`** is a hand list. Use it to *bring up* a new model: read what each quirk does,
   toggle them until it works, then **graduate** the working set into `models.yml` as a new
@@ -86,7 +86,7 @@ so a shared session shares one stash.
 Declares `outbound_normalize` (normalize the frame before **every** resource call — inbound
 **and** `handle_tool_calls` intercept re-calls, via the executor's `_execute_resource_step`
 chokepoint) and `post_response` (capture reasoning on outbound). Valid in
-`identity.context.plugins` / `role.context.plugins`. Wire it on the buddy that talks to the
+`identity.context.plugins` / `role.context.plugins`. Wire it on the agent that talks to the
 strict provider through a harness-owned tool loop.
 
 Putting it on a **role** (e.g. `my_agent_role`) covers all of that agent's identities — one
@@ -96,9 +96,9 @@ wiring works no matter which harness it's reached through.
 
 The end-state is a **fully bridge-owned tool loop** — then the bridge never loses the
 reasoning in the first place, and quirks like `reattach_reasoning` become moot. Provider-level
-placement (`quirks_mode` on `resource.plugins`, so any buddy on a strict resource inherits it)
+placement (`quirks_mode` on `resource.plugins`, so any agent on a strict resource inherits it)
 is the planned next step — see [`notes/DESIGN-quirks-mode-on-resource.md`](../../../../notes/DESIGN-quirks-mode-on-resource.md).
-Until then, this keeps harness-owned buddies working on strict providers across any harness.
+Until then, this keeps harness-owned agents working on strict providers across any harness.
 It depends on the bridge actually *capturing* reasoning while streaming — see the key-drift
 fix in `app/stream_reconstruct.py` (it accumulates `reasoning` + `reasoning_details`, not just
 `reasoning_content`).

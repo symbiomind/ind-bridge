@@ -1,6 +1,6 @@
 # conversational_memory
 
-Automatic cross-session memory for AI buddies via memory-mcp-ce.
+Automatic cross-session memory for AI agents via memory-mcp-ce.
 
 This is the V4 port of the V1→V3 plugin that started the whole project. AIs need to be reminded to remember to remember, and the bridge does it without the model having to consciously call a tool. **The agent doesn't decide to recall or store — the bridge does it.**
 
@@ -51,7 +51,7 @@ resources:
 
 ```yaml
 roles:
-  my_besterest_buddy:
+  my_agent:
     resource: openrouter
     plugins:
       OpenAI-Protocol: {model: minimax/minimax-m2.7}
@@ -67,14 +67,14 @@ roles:
 
 identities:
   user_via_librechat:
-    role: my_besterest_buddy
+    role: my_agent
     token: ${USER_TOKEN}
     context:
       name: User
       trust: trusted
 
   cron_recall_only:
-    role: my_besterest_buddy
+    role: my_agent
     context:
       name: cron
       trust: agent
@@ -115,15 +115,9 @@ V4 enforces that any identity wiring `*.context.plugins` (or `*.response.plugins
 - **MCP exception during store** → log error with `exc_info`, response was already delivered, no impact on user.
 - **Housekeeping turn detected** → log debug, skip store (intentional — heartbeats and /new openers are not conversation worth remembering).
 
-## Design references
-
-- `~/Documents/ind-v4-brainstorm.md` — the spec, especially the "Plugin Capability Contract" section's `conversational_memory` worked example.
-- `~/Documents/ind-v4-decisions.md` — D-007 (`post_response`) and D-009 (slot-loosening for paired recall+store plugins).
-- `project_bridge_origin_story.md` (auto-memory) — why this plugin existed in V1, drove the harness→bridge pivot, and is *the* canonical "AI in the loop" plugin for the bridge.
-
 ## Deferred for later
 
 - **L2 wakeup** (recency cascade on `/new`) — needs `is_new_session` from basic_session.
 - **L3 wakeup** (trending labels on `/new`) — same dependency.
-- **memory_enricher nudge** — the V3 plugin pings the enricher after store; will re-add when enricher ports.
+- ~~**memory_enricher nudge**~~ — DONE. Label enrichment now lives IN this plugin (the standalone `memory_enricher` plugin was retired). A worker role (e.g. `label_llm`) labels nonce-marked memories by being fired in-process via `execute()` (see the "LABEL ENRICHMENT" section in `__init__.py`); `observe_response` nudges the matching per-store catch-up loop after a store. Wire it via the `server.plugins.conversational_memory` registry + a `tasks: [label_enrichment]` worker role.
 - **Verified-caller multi-hop attribution** — bridge_message will drive this primitive when it ports.

@@ -1,7 +1,7 @@
 """bridge_native — the bridge-wide tool-namespacing invariant.
 
-Bridge-native tools (tools the bridge offers the buddy via ``handle_tool_calls``
-plugins and executes locally) are ALWAYS presented to the buddy with a hard
+Bridge-native tools (tools the bridge offers the agent via ``handle_tool_calls``
+plugins and executes locally) are ALWAYS presented to the agent with a hard
 prefix so they can never collide with harness/client-supplied tools that arrive
 in ``ctx.request.tools`` at request time. The startup validator can reject two
 *bridge plugins* claiming the same tool name on one identity, but it cannot see

@@ -19,8 +19,11 @@ Three capabilities, one plugin (the agent_tools shape, plus discovery):
     exactly like agent_tools. The agent sees them as native callable tools.
 
   * ``handle_tool_calls`` (D-008) — when the agent calls one, route it to the
-    right MCP server and execute it (fresh connection per call, like
-    conversational_memory), returning the result as the tool-result string.
+    right MCP server and execute it, returning the result as the tool-result
+    string. Default is fresh-connection-per-call (like conversational_memory);
+    a resource may opt into ``persistent: true`` to reuse ONE held session
+    across calls (see the persistent-session pool below) — needed for
+    gateway-fronted stdio servers whose containers otherwise cold-start per call.
 
 Three-layer tool name the agent sees::
 
@@ -67,6 +70,7 @@ validated at startup).
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 import logging
@@ -98,9 +102,9 @@ _NS_SEP = "__"  # sub-namespace separator (matches bridge_native's prefix style)
 # Registry is keyed by (resource_key, tool_name) — the RESOURCE, not the
 # server_key alias. Two roles can name a server the same (`filesystem`) while
 # pointing at DIFFERENT resources (`agent_a_filesystem` vs `filesystem`); the
-# server_key is buddy-facing presentation, the resource is the true identity, so
+# server_key is agent-facing presentation, the resource is the true identity, so
 # routing/defs key on the resource to avoid cross-role collision (last-writer-wins
-# bleed). The buddy-facing wire name still uses server_key — built per-role at
+# bleed). The agent-facing wire name still uses server_key — built per-role at
 # injection by mapping the role's server_key → resource_key.
 _tool_defs: dict[tuple[str, str], dict] = {}
 """``(resource_key, tool_name)`` → OpenAI function def dict, built with the RAW
@@ -123,7 +127,7 @@ def OWNED_TOOLS() -> list[str]:
     satisfying the non-empty presence invariant (discovery hasn't run at
     validation time).
 
-    Claimable names are the BUDDY-FACING ``server_key__tool`` forms (NO
+    Claimable names are the AGENT-FACING ``server_key__tool`` forms (NO
     bridge_native prefix; core strips it before matching). The registry is keyed
     by resource (not server_key) and the wire name uses server_key, so we map
     each DISCOVERED resource back to EVERY server_key alias that points at it,
@@ -190,6 +194,17 @@ def _resolve_conn(resource_key: str | None) -> dict | None:
         "endpoint_url": endpoint_url,
         "token": cfg.get("token") or "",
         "timeout": float(timeout_raw) if timeout_raw is not None else 120.0,
+        # Opt-in (default off): keep ONE MCP session open to this resource and
+        # reuse it across calls, instead of open-and-teardown per call. ONLY for
+        # gateway-fronted STDIO servers (docker/git), where each new bridge
+        # session forces the gateway to cold-`docker run` a fresh container (the
+        # gateway's `longLived` keptClients cache is keyed PER SESSION, so a
+        # fresh session every call = guaranteed cache miss = ~20s cold-start
+        # every time). Plain long-running HTTP MCP servers (memory-mcp-ce) don't
+        # benefit and should leave this off — the stateless path stays the
+        # default. ``resource_key`` is carried so _call_tool can key the pool.
+        "persistent": bool(cfg.get("persistent")),
+        "resource_key": resource_key,
     }
 
 
@@ -277,7 +292,7 @@ def _role_server_map(ctx: "PipelineCtx") -> dict[str, dict]:
 def _role_server_to_resource(ctx: "PipelineCtx") -> dict[str, str]:
     """THIS role's ``server_key -> resource_key`` map (from
     ``role.plugins.mcp_client``). The registry is keyed by resource, so injection
-    and dispatch use this to translate the buddy-facing server_key alias into the
+    and dispatch use this to translate the agent-facing server_key alias into the
     resource whose discovered tools/route to use. Empty if the role declares no
     server map. (Server entries with no ``resource`` are skipped.)"""
     from app import config as app_config
@@ -298,7 +313,7 @@ def _all_server_to_resource_pairs() -> list[tuple[str, str]]:
     """Every ``(server_key, resource_key)`` pair across all roles' mcp_client
     maps — as a LIST of pairs, NOT a dict. A dict keyed by server_key collides
     when multiple roles share a server_key (`filesystem` → three different
-    per-buddy resources) and silently drops all but one alias, which broke
+    per-agent resources) and silently drops all but one alias, which broke
     OWNED_TOOLS claim-matching (the dropped survivor could be a stale/undiscovered
     resource → filesystem tools never claimed → leaked to the harness). Keeping
     pairs preserves every alias→resource edge."""
@@ -418,7 +433,8 @@ def _build_openai_def(clean_name: str, tool) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# MCP calls — fresh connection per call (conversational_memory's pattern)
+# MCP calls — fresh connection per call (conversational_memory's pattern),
+# OR a persistent reused session for gateway-fronted stdio resources (opt-in).
 # ---------------------------------------------------------------------------
 
 async def _list_tools(conn: dict) -> list:
@@ -434,7 +450,176 @@ async def _list_tools(conn: dict) -> list:
             return list(result.tools)
 
 
+# --- Persistent session pool (opt-in; see _resolve_conn 'persistent') --------
+#
+# Goal: keep ONE MCP session open across calls so the gateway sees a STABLE
+# session and its `longLived` container stays warm (cold-start paid once).
+#
+# WHY AN OWNER TASK (and not just an AsyncExitStack kept open across calls):
+# ``ClientSession`` and ``streamablehttp_client`` open anyio task groups / cancel
+# scopes BOUND TO THE TASK THAT ENTERED THEM. A bridge request runs in its own
+# asyncio task; when that request's task ends, anyio tears down any scope entered
+# inside it — the session's reader dies and the NEXT call (a different task) gets
+# ``ClosedResourceError`` ("exit cancel scope in a different task than it was
+# entered in"). So the contexts must be entered AND exited in ONE long-lived task.
+#
+# Pattern: each persistent resource gets a dedicated OWNER coroutine (an actor).
+# It opens the session, initialises it, then loops pulling jobs off a queue,
+# runs ``call_tool`` IN ITS OWN TASK, and resolves each job's future. Request
+# tasks only ``put`` a job and ``await`` its future — they never touch the MCP
+# contexts, so no cross-task scope violation. The owner is a DETACHED top-level
+# task (tracked in ``_owner_tasks``), so it outlives the request that spawned it.
+
+_session_owners: dict[str, "_SessionOwner"] = {}
+_owner_tasks: dict[str, asyncio.Task] = {}
+_pool_lock = asyncio.Lock()  # guards create/replace of a resource's owner
+
+
+class _SessionOwner:
+    """Actor owning one persistent MCP session. ``call`` is the only public
+    entry: it's awaited by request tasks; the work runs in the owner task."""
+
+    def __init__(self, resource_key: str, conn: dict):
+        self.resource_key = resource_key
+        self.conn = conn
+        self._jobs: asyncio.Queue = asyncio.Queue()
+        self._ready: asyncio.Future = asyncio.get_event_loop().create_future()
+        self._closing = False
+
+    async def call(self, raw_tool_name: str, args: dict):
+        """Submit a tool call to the owner task and await its result. Raises if
+        the session failed to open (caller drops + retries)."""
+        await self._ready  # propagates open/initialise failure to the caller
+        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        await self._jobs.put((raw_tool_name, args, fut))
+        return await fut
+
+    async def run(self):
+        """Owner-task body: open the session, signal ready, serve jobs until
+        cancelled. ALL context enter/exit + call_tool happen in THIS task."""
+        from mcp import ClientSession
+        from mcp.client.streamable_http import streamablehttp_client
+
+        token = self.conn["token"]
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        try:
+            async with streamablehttp_client(self.conn["endpoint_url"], headers=headers) as (read, write, _):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    if not self._ready.done():
+                        self._ready.set_result(True)
+                    logger.info(
+                        f"mcp_client: opened persistent session for resource "
+                        f"'{self.resource_key}' (gateway container will stay warm)."
+                    )
+                    await self._serve(session)
+        except asyncio.CancelledError:
+            raise
+        except BaseException as e:
+            # Open/serve failed — wake any waiter on _ready, fail in-flight jobs.
+            if not self._ready.done():
+                self._ready.set_exception(e)
+            self._fail_pending(e)
+            logger.warning(
+                f"mcp_client: persistent session owner for "
+                f"'{self.resource_key}' exited ({type(e).__name__}: {e})."
+            )
+
+    async def _serve(self, session):
+        while not self._closing:
+            raw_tool_name, args, fut = await self._jobs.get()
+            if fut.cancelled():
+                continue
+            try:
+                result = await session.call_tool(raw_tool_name, arguments=args)
+                if not fut.done():
+                    fut.set_result(result)
+            except asyncio.CancelledError:
+                # Session is going down — fail this job and re-raise so the
+                # owner unwinds its contexts in its OWN task (correct scope).
+                if not fut.done():
+                    fut.set_exception(asyncio.CancelledError())
+                raise
+            except BaseException as e:
+                # A single call failed (e.g. gateway dropped). Fail THIS job and
+                # exit the owner so the resource gets a fresh session next call.
+                if not fut.done():
+                    fut.set_exception(e)
+                self._fail_pending(e)
+                raise
+
+    def _fail_pending(self, e: BaseException):
+        while not self._jobs.empty():
+            try:
+                _t, _a, fut = self._jobs.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if not fut.done():
+                fut.set_exception(e)
+
+
+async def _get_owner(conn: dict) -> _SessionOwner:
+    """Return the resource's session owner, spawning its detached task on first
+    use (double-checked under _pool_lock)."""
+    resource_key = conn["resource_key"]
+    owner = _session_owners.get(resource_key)
+    if owner is not None:
+        return owner
+    async with _pool_lock:
+        owner = _session_owners.get(resource_key)
+        if owner is None:
+            owner = _SessionOwner(resource_key, conn)
+            _session_owners[resource_key] = owner
+            _owner_tasks[resource_key] = asyncio.ensure_future(owner.run())
+    return owner
+
+
+async def _drop_owner(resource_key: str) -> None:
+    """Cancel and forget a resource's session owner (gateway restart / broken
+    pipe / shutdown). The owner unwinds its MCP contexts in its OWN task on
+    cancellation — the correct anyio scope. Best-effort."""
+    owner = _session_owners.pop(resource_key, None)
+    if owner is not None:
+        owner._closing = True
+    task = _owner_tasks.pop(resource_key, None)
+    if task is not None and not task.done():
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception) as e:
+            logger.debug(f"mcp_client: owner '{resource_key}' teardown — {type(e).__name__}: {e}")
+
+
+async def shutdown() -> None:
+    """Cancel every persistent session owner. Wired from the bridge lifespan
+    shutdown so the gateway's `--rm` containers don't leak when the bridge
+    stops."""
+    for resource_key in list(_session_owners.keys()):
+        await _drop_owner(resource_key)
+
+
+async def _call_tool_persistent(conn: dict, raw_tool_name: str, args: dict):
+    """Submit a call to the resource's session owner. On a session error, drop
+    the dead owner and retry ONCE with a fresh one — mirrors the gateway's own
+    delete-on-error so a gateway restart doesn't permanently wedge the tools."""
+    resource_key = conn["resource_key"]
+    owner = await _get_owner(conn)
+    try:
+        return await owner.call(raw_tool_name, args)
+    except Exception as e:
+        logger.warning(
+            f"mcp_client: persistent session for '{resource_key}' failed "
+            f"({type(e).__name__}: {e}) — dropping and retrying once."
+        )
+        await _drop_owner(resource_key)
+        owner = await _get_owner(conn)
+        return await owner.call(raw_tool_name, args)
+
+
 async def _call_tool(conn: dict, raw_tool_name: str, args: dict):
+    if conn.get("persistent"):
+        return await _call_tool_persistent(conn, raw_tool_name, args)
+
     from mcp import ClientSession
     from mcp.client.streamable_http import streamablehttp_client
 
@@ -447,9 +632,9 @@ async def _call_tool(conn: dict, raw_tool_name: str, args: dict):
 
 
 def _stringify(result) -> str:
-    """Extract text content from an MCP CallToolResult and hand it to the buddy
+    """Extract text content from an MCP CallToolResult and hand it to the agent
     as the tool-result string. Unlike conv_mem (which json.loads to consume
-    structured fields), we pass the raw text through — the buddy reads it."""
+    structured fields), we pass the raw text through — the agent reads it."""
     try:
         parts = []
         for item in getattr(result, "content", None) or []:
@@ -544,7 +729,7 @@ async def handle_tool_calls(ctx: "PipelineCtx", config: dict) -> str:
     We split off the server_key, route to that server's resource, and call the
     real MCP tool (fresh connection per call). Known-bad inputs return an error
     string; genuine MCP/network failures propagate to the executor's synthetic
-    tool-error path so the buddy narrates the failure."""
+    tool-error path so the agent narrates the failure."""
     tc = ctx.plugin_data.get("handle_tool_calls.claimed")
     if not isinstance(tc, dict):
         return "[mcp_client error: no claimed tool_call on ctx.plugin_data]"

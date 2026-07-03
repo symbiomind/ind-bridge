@@ -47,7 +47,7 @@ logger = logging.getLogger(__name__)
 
 KNOWN_CAPABILITIES: dict[str, list[str]] = {
     "listener":          ["identity.plugins"],
-    "background":        ["identity.plugins"],
+    "background":        ["identity.plugins", "session.plugins"],
     "outbound_params":   ["identity.plugins", "role.plugins",
                           "session.plugins", "resource.plugins"],
     "context_modify":    ["identity.context.plugins",
@@ -64,11 +64,11 @@ KNOWN_CAPABILITIES: dict[str, list[str]] = {
     "handle_tool_calls": ["identity.plugins", "role.plugins"],
 }
 """The capabilities a V4 plugin may declare and the slots in which
-each capability is valid. Nine valid slot strings total (per D-006 —
-sessions have only `session.plugins`, not session.context.plugins or
-session.response.plugins; sessions are resource-shaped, not role-shaped).
-This is the canonical contract from the brainstorm; any other module
-that needs to reason about valid placements imports from here.
+each capability is valid (per D-006 — sessions have only `session.plugins`,
+not session.context.plugins or session.response.plugins; sessions are
+resource-shaped, not role-shaped). This is the canonical contract from the
+brainstorm; any other module that needs to reason about valid placements
+imports from here.
 
 `background` (D-011) is the *spawn-a-loop-at-startup* capability — the
 generic cousin of `listener`. Where `listener` materialises an HTTP route,
@@ -76,13 +76,16 @@ generic cousin of `listener`. Where `listener` materialises an HTTP route,
 request cycle (a polling daemon, a cron-like ticker). Core calls the
 plugin's ``start_background(StartupCtx, config)`` once during lifespan
 startup, schedules the returned coroutine on the event loop, and tracks the
-task so lifespan shutdown can cancel it cleanly. Like `listener` it is
-per-identity (only valid on `identity.plugins`) — the identity that wires
-the plugin is the one whose loop spawns. First consumer: ``memory_enricher``
-(background label enrichment). Future consumers ride the same seam:
-cron-triggered identities (Agent_Dream), the bridge originating its own
-messages. The V3 ``server.startup`` hook did NOT survive the rewrite; this
-is its V4-shaped, capability-dispatched replacement.
+task so lifespan shutdown can cancel it cleanly. It is per-identity (the
+identity that wires the plugin is the one whose loop spawns), but the wiring
+may live on `identity.plugins` (cron) OR `session.plugins`
+(basic_session's daily session-reset-archive scheduler) — `_spawn_background_tasks`
+discovers the plugin on whichever slot it occupies. Consumers: ``cron``
+(scheduled turns), ``basic_session`` (daily reset), ``conversational_memory``
+(SERVER-SCOPED label-enrichment loops, spawned once from the
+``server.plugins.conversational_memory`` registry — not per-identity), and
+``bridge_messaging`` (phonebook build). The V3 ``server.startup`` hook did NOT
+survive the rewrite; this is its V4-shaped, capability-dispatched replacement.
 
 `post_response` (D-007) is the *observe-after-delivery* capability: fires
 in a background task after the response leaves the bridge for the client,
@@ -174,11 +177,14 @@ spawns discovery for every identity on it — the whole point of the fan-out).""
 # Known non-plugin keys at each cascade level. A sub-key on an identity /
 # role / session / resource / server block that's neither in this set nor
 # a plugins-style slot is ill-formed config.
+# `max_tool_laps` is a bare scalar (like `timezone`) valid at every cascade
+# level — it's the agentic tool-loop runaway guardrail, resolved top-down by
+# _resolve_max_tool_laps (identity → role → session → resource → server → env).
 KNOWN_KEYS_SERVER: frozenset[str] = frozenset(
-    {"timezone", "resources", "sessions", "roles", "identities", "plugins"}
+    {"timezone", "max_tool_laps", "resources", "sessions", "roles", "identities", "plugins"}
 )
 KNOWN_KEYS_RESOURCE: frozenset[str] = frozenset(
-    {"plugins", "endpoint_url", "token", "timeout"}
+    {"plugins", "endpoint_url", "token", "timeout", "max_tool_laps", "persistent"}
     # V3 nested plugins under `endpoint:` — V4 wants them directly under
     # `plugins:` per D-006. We deliberately don't list `endpoint` here so
     # operators with V3-shape configs get a loud warning.
@@ -187,16 +193,20 @@ KNOWN_KEYS_RESOURCE: frozenset[str] = frozenset(
     # `timeout` is per-resource seconds (float-coerced at use site, V4
     # fail-loud-at-use idiom). Consumed by resource consumers — today
     # `conversational_memory` uses it for both recall and store calls.
+    # `persistent` (bool, default false) is an mcp_client opt-in: keep ONE MCP
+    # session warm across calls for gateway-fronted stdio servers (docker/git)
+    # whose containers otherwise cold-start per call. Read in
+    # mcp_client._resolve_conn; ignored by resources that don't front a gateway.
 )
-KNOWN_KEYS_SESSION: frozenset[str] = frozenset({"plugins"})
+KNOWN_KEYS_SESSION: frozenset[str] = frozenset({"plugins", "max_tool_laps"})
 KNOWN_KEYS_ROLE: frozenset[str] = frozenset(
-    {"resource", "session", "plugins", "context", "response"}
+    {"resource", "session", "plugins", "context", "response", "max_tool_laps"}
 )
 KNOWN_KEYS_IDENTITY: frozenset[str] = frozenset(
     {
         "role", "roles", "token", "session",
         "bridge_agent", "display_name", "trust", "inbound_identity",
-        "plugins", "context", "response",
+        "plugins", "context", "response", "max_tool_laps",
     }
 )
 KNOWN_KEYS_CONTEXT_BLOCK: frozenset[str] = frozenset(

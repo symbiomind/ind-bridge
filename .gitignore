@@ -1,6 +1,8 @@
 # Project Directories
 data/*
 notes/
+# local operational utilities (e.g. one-off session repair) — not shipped engine code
+tools/
 .obsidian/
 .claude/
 

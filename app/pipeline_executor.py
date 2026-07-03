@@ -46,7 +46,7 @@ from starlette.background import BackgroundTask
 
 from . import (
     bridge_native, bridge_sign, config, dev_trace, frame_emit,
-    pipeline_assembler, plugin_loader, stream_reconstruct,
+    pipeline_assembler, plugin_loader, stream_intercept, stream_reconstruct,
 )
 from .context import (
     IdentityInfo, PipelineCtx, RequestInfo, ResourceInfo, RoleInfo,
@@ -92,6 +92,19 @@ def _is_post_response_tuple(plugin: Any) -> bool:
     matching alone isn't enough. We have to ask the capability table."""
     caps = plugin_loader.get_capabilities(_short_name(plugin)) or {}
     return "post_response" in caps
+
+
+def _has_response_modify(pipeline: list) -> bool:
+    """True iff any tuple is a response_modify plugin (lives in a response
+    slot AND declares the capability). The streaming-intercept path can't be
+    used when response_modify is wired — that plugin needs the whole buffered
+    frame to rewrite it, which is incompatible with forwarding content live."""
+    for slot, plugin, _cfg in pipeline:
+        if slot in _RESPONSE_SLOTS:
+            caps = plugin_loader.get_capabilities(_short_name(plugin)) or {}
+            if "response_modify" in caps:
+                return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -257,6 +270,61 @@ async def execute(
         # model. The third (post_response observe) and fourth (passthrough)
         # categories don't trigger buffering.
         pre_delivery_wired = pipeline_assembler.has_pre_delivery_plugins(pipeline)
+
+        # ── THE THIRD PATH: stream-while-intercepting ("the pause IS the tool")
+        # When the client wants streaming AND the only pre-delivery work is
+        # handle_tool_calls intercepts (NOT response_modify, which needs the
+        # whole buffered frame), we can stream the bridge-owned tool loop live:
+        # forward the agent's content deltas as a natural keepalive, swallow
+        # bridge-native tool_calls, run them between laps (the client sees a
+        # pause), and stitch to one [DONE]. Kills the long-loop client timeout
+        # (→ the cancellation turn-loss gap) and makes invisible bridge tools
+        # legible. Opt-in via BRIDGE_STREAM_INTERCEPTS=1 during dogfooding.
+        if (
+            ctx.request.stream
+            and pipeline_assembler.has_intercepts(pipeline)
+            and not _has_response_modify(pipeline)
+            and os.getenv("BRIDGE_STREAM_INTERCEPTS") == "1"
+        ):
+            logger.info(
+                f"Identity '{identity_key}': streaming-intercept path "
+                f"(content forwarded live as keepalive; bridge tool loop "
+                f"runs in the pauses; stitched to one stream)."
+            )
+            ctx.slots_visited.append("[core] streaming-intercept path")
+
+            # After the stream closes (ctx.response = final lap), fire the
+            # post_response observers (basic_session save, conversational_memory)
+            # so the streaming path persists the full exchange like the others,
+            # THEN flush the dev_trace. This path returns a StreamingResponse
+            # immediately (below) and never reaches the end_request calls on the
+            # other branches, so without this flush the streaming-intercept path
+            # produces NO trace file — the trace is built in memory and lost when
+            # the request ends. on_complete fires in the generator's finally
+            # (even on client disconnect), so the trace is flushed AFTER the
+            # observers' events are recorded — mirroring the pass-through path,
+            # which closes its trace inside _dispatch_observers_after_stream.
+            async def _save_after_stream() -> None:
+                for slot, plugin, plugin_config in _collect_observer_tuples(pipeline):
+                    await _run_observer(plugin, plugin_config, ctx, slot)
+                dev_trace.end_request(
+                    ctx.dev_trace, status="ok-stream-intercept",
+                    response_summary="streaming-intercept path; observers fired after stream close",
+                )
+
+            gen = await stream_intercept.stream_with_intercepts(
+                ctx, pipeline,
+                build_request=_build_outbound_request,
+                intercept_tuples=_collect_intercept_tuples(pipeline),
+                plugin_owned_tools=_plugin_owned_tools,
+                tool_call_name=_tool_call_name,
+                run_intercept_plugin=_run_intercept_plugin,
+                build_assistant_turn=_build_assistant_turn_from_response,
+                max_tool_laps=ctx.max_tool_laps,
+                on_complete=_save_after_stream,
+            )
+            return StreamingResponse(gen(), media_type="text/event-stream")
+
         if pre_delivery_wired and ctx.request.stream:
             logger.info(
                 f"Identity '{identity_key}': pre-delivery plugins wired; "
@@ -408,6 +476,9 @@ def _build_ctx(identity_key: str, raw_body: dict, headers: dict[str, str]) -> Pi
     role_cfg = config.resolve_role(role_key) or {}
     resource_key = role_cfg.get("resource") or ""
     session_key = role_cfg.get("session")
+    resource_cfg = config.resolve_resource(resource_key) or {}
+    session_cfg = (config.resolve_session(session_key) or {}) if session_key else {}
+    server_cfg = config.get_server_cfg() or {}
 
     # context: sugar fields — cascade-merged, identity overrides role.
     # Role provides defaults (e.g. roles.my_agent.context.name: "Guest");
@@ -437,7 +508,47 @@ def _build_ctx(identity_key: str, raw_body: dict, headers: dict[str, str]) -> Pi
     # popped here so it never reaches the upstream model provider. Signed into
     # <bridge_context> downstream by populate_caller like any other additional.
     cron_additional = raw_body.pop("_cron_additional", None) if isinstance(raw_body, dict) else None
-    if isinstance(cron_additional, dict):
+
+    # Internally-originated callers may ALSO override the caller's name + trust via
+    # reserved `_bridge_caller` / `_bridge_trust` body keys. This is how an in-process
+    # sender (bridge_messaging) delivers a turn AS a synthetic caller through a carrier
+    # identity's pipeline: it drives execute() on the target role's carrier identity,
+    # but overrides the WHO so the signed <caller> reflects the real sender, not the
+    # carrier. SOVEREIGN by construction — these keys originate inside the bridge (an
+    # external HTTP body that set them never reaches here as a "trusted" caller because
+    # the listener builds raw_body from client JSON; bridge_messaging injects them
+    # in-process). Popped before the upstream call so they never leak to the provider;
+    # signed into <bridge_context> downstream by populate_caller.
+    bridge_no_tools = False
+    bridge_caller = None
+    bridge_storage = None
+    if isinstance(raw_body, dict):
+        bridge_caller = raw_body.pop("_bridge_caller", None)
+        bridge_trust = raw_body.pop("_bridge_trust", None)
+        bridge_no_tools = bool(raw_body.pop("_bridge_no_tools", False))
+        # Signed turn-handling marker (bridge_messaging sets "false" for an
+        # ephemeral turn). A property of the TURN, so it becomes an attribute on
+        # the <bridge_context> envelope (not the <caller>), folded into the
+        # signature by assemble_and_sign. Popped so it never reaches the provider.
+        bridge_storage = raw_body.pop("_bridge_storage", None)
+        if isinstance(bridge_caller, str) and bridge_caller:
+            name = bridge_caller          # synthetic caller overrides carrier name
+        if isinstance(bridge_trust, str) and bridge_trust:
+            trust = bridge_trust          # e.g. "bridge_messaging"
+
+    # SOVEREIGN ADDITIONAL (whitelist, not merge). When a synthetic caller is set
+    # (_bridge_caller present), the WHO is wholly the bridge's, not the carrier's —
+    # the name and trust are *replaced* above, and the caller ATTRIBUTES must follow
+    # the same rule. The carrier identity's own `additional` (its curl/harness
+    # decoration, e.g. information="Claude Code dropping in to say hi") must NOT ride
+    # along onto an agent-to-agent <caller>. So we DROP the carrier base entirely and
+    # rebuild from only the bridge-intended kv in `_cron_additional` (which already
+    # carries the bridge `tool`/`storage` signals + any explicit `additional` arg the
+    # sender passed). Normal turns (no _bridge_caller) keep the historical MERGE so
+    # cron/identity decoration still layers as before.
+    if isinstance(bridge_caller, str) and bridge_caller:
+        additional = dict(cron_additional) if isinstance(cron_additional, dict) else {}
+    elif isinstance(cron_additional, dict):
         additional = {**additional, **cron_additional}  # job wins per key
 
     identity = IdentityInfo(
@@ -464,13 +575,66 @@ def _build_ctx(identity_key: str, raw_body: dict, headers: dict[str, str]) -> Pi
         raw_body=raw_body,
     )
 
-    return PipelineCtx(
+    # TEMP DEBUG (passthrough investigation 2026-06-24): log the RAW inbound client
+    # tool names — what LibreChat/OpenClaw actually forwards in raw_body["tools"],
+    # BEFORE any plugin (mcp_client) injects bridge-native tools. This is the ground
+    # truth for "do non-bridge-native client tools pass through?". Remove after the
+    # personal-mcp passthrough test.
+    _inbound_tool_names = [
+        (t.get("function") or {}).get("name")
+        for t in request.tools
+        if isinstance(t, dict)
+    ]
+    logger.info(
+        f"[INBOUND TOOLS] identity={identity_key!r} count={len(request.tools)} "
+        f"names={_inbound_tool_names}"
+    )
+
+    # TEMP DEBUG (fold/leak investigation 2026-06-24): log the inbound MESSAGE
+    # roles the client (LibreChat) replayed to us — specifically whether it sent
+    # back any assistant(tool_calls) or role:tool turns. If it does, LibreChat is
+    # keeping its OWN tool history and the in_tool_loop verbatim path fires
+    # (fold-bypassed). Remove after the investigation.
+    _inbound_msgs = request.messages or []
+    _role_counts: dict = {}
+    _asst_with_tc = 0
+    for _m in _inbound_msgs:
+        if not isinstance(_m, dict):
+            continue
+        _role_counts[_m.get("role")] = _role_counts.get(_m.get("role"), 0) + 1
+        if _m.get("role") == "assistant" and _m.get("tool_calls"):
+            _asst_with_tc += 1
+    logger.info(
+        f"[INBOUND MSGS] identity={identity_key!r} roles={_role_counts} "
+        f"assistant_with_tool_calls={_asst_with_tc} "
+        f"role_tool={_role_counts.get('tool', 0)}"
+    )
+
+    max_tool_laps = _resolve_max_tool_laps(
+        identity_cfg, role_cfg, session_cfg, resource_cfg, server_cfg,
+    )
+
+    ctx = PipelineCtx(
         identity=identity,
         role=role,
         resource=resource,
         request=request,
         headers={k.lower(): v for k, v in (headers or {}).items()},
+        max_tool_laps=max_tool_laps,
     )
+    # Delivery turns (bridge_messaging) carry _bridge_no_tools: the recipient REPLIES
+    # in words, with no tools, regardless of what context plugins inject. Stashed here;
+    # enforced at the resource-call gate (_do_http_call_*). Ordering-proof.
+    if bridge_no_tools:
+        ctx.plugin_data["bridge_messaging.no_tools"] = True
+    # Stash the signed storage marker onto the bridge_context so assemble_and_sign
+    # renders + signs it as a <bridge_context> opening-tag attribute. Only when a
+    # synthetic bridge caller is present (an in-process bridge_messaging delivery)
+    # — same sovereignty as _bridge_caller/_bridge_trust: originates inside the
+    # bridge, never from an external body claiming to be trusted.
+    if isinstance(bridge_caller, str) and bridge_caller and isinstance(bridge_storage, str) and bridge_storage:
+        ctx.bridge_context["_attr_storage"] = bridge_storage
+    return ctx
 
 
 # ---------------------------------------------------------------------------
@@ -582,7 +746,12 @@ def _build_outbound_request(ctx: PipelineCtx) -> tuple[str, dict, dict, float]:
     # Use possibly-mutated messages from the working copy (post-context-modify
     # and post-bridge_sign-injection)
     body["messages"] = ctx.request.messages
-    if ctx.request.tools:
+    # bridge_messaging delivery turn → NO tools upstream, whatever context plugins
+    # injected. The recipient replies in words. Ordering-proof: this is the final gate.
+    if ctx.plugin_data.get("bridge_messaging.no_tools"):
+        body.pop("tools", None)
+        body.pop("tool_choice", None)
+    elif ctx.request.tools:
         body["tools"] = ctx.request.tools
     if ctx.request.model:
         body["model"] = ctx.request.model
@@ -777,10 +946,24 @@ async def _do_http_call_stream(
                     yield b"data: [DONE]\n\n"
                     return
 
+                # The client gets verbatim upstream bytes (passthrough
+                # invariant). The TEE, however, must hold COMPLETE SSE lines:
+                # aiter_bytes splits events mid-JSON, and reconstructing those
+                # per-slice corrupts the STORED turn (per-word newlines +
+                # duplicated reasoning — proven via raw-OpenRouter curl,
+                # 2026-06-23). So we forward raw bytes but buffer them into whole
+                # lines for the tee.
+                sse_buf = b""
                 async for chunk in upstream.aiter_bytes():
+                    yield chunk  # verbatim to client — never reframe the wire
                     if has_observers:
-                        teed_chunks.append(chunk)
-                    yield chunk
+                        sse_buf += chunk
+                        while b"\n" in sse_buf:
+                            line, sse_buf = sse_buf.split(b"\n", 1)
+                            if line:
+                                teed_chunks.append(line + b"\n")
+                if has_observers and sse_buf:
+                    teed_chunks.append(sse_buf)  # flush any trailing partial line
         except httpx.HTTPError as e:
             logger.error(
                 f"Streaming HTTP error to {url}: {type(e).__name__}: {e!r}"
@@ -1121,9 +1304,13 @@ async def _dispatch_intercepts(ctx: PipelineCtx, pipeline: list) -> PipelineCtx:
     """Walk plugins declaring ``handle_tool_calls`` (D-008). Each plugin
     claims tool_calls by name (its module-level ``OWNED_TOOLS`` list);
     if a plugin returns a modified ctx with rewritten messages, the
-    executor re-runs the resource step (one re-call by default — capped
-    via ``BRIDGE_HANDLE_TOOL_CALLS_MAX_LAPS`` env var, default 1) so the
-    agent reacts in their own voice.
+    executor re-runs the resource step so the agent reacts in their own
+    voice, and keeps re-calling for as long as the model keeps calling
+    tools — up to ``ctx.max_tool_laps`` laps (a cascade-resolved runaway
+    guardrail; ``0`` means uncapped, run until ``finish_reason != tool_calls``).
+    This is the bridge acting as its own agentic harness for bridge-native
+    tools. The cap is a cost/latency bound, NOT a feature leash — the
+    never-leak guard makes an unbounded model safe.
 
     Reached only after the resource step on the buffered (non-streaming
     upstream) path — pre-delivery plugins require an assembled frame.
@@ -1135,9 +1322,14 @@ async def _dispatch_intercepts(ctx: PipelineCtx, pipeline: list) -> PipelineCtx:
     if not intercept_tuples:
         return ctx
 
-    max_laps = _max_intercept_laps()
+    # Runaway guardrail, cascade-resolved at ctx-build time (identity → role →
+    # session → resource → server → env → 1). 0 == uncapped: run until the
+    # model stops calling tools. The never-leak guard makes uncapped safe.
+    max_laps = ctx.max_tool_laps
+    uncapped = max_laps <= 0
 
-    for lap in range(max_laps + 1):
+    lap = 0
+    while True:
         # Read the assembled assistant message + tool_calls + finish_reason
         # off ctx.response["_full_response"] (populated by
         # _do_http_call_nonstream OR a previous re-call iteration).
@@ -1162,7 +1354,7 @@ async def _dispatch_intercepts(ctx: PipelineCtx, pipeline: list) -> PipelineCtx:
             for i, tc in enumerate(tool_calls):
                 name = _tool_call_name(tc)
                 # Strip the bridge-native prefix before the OWNED_TOOLS match:
-                # the buddy returns the prefixed wire name (e.g.
+                # the agent returns the prefixed wire name (e.g.
                 # bridge_native__rng_message) but OWNED_TOOLS is clean
                 # (rng_message). strip_namespace is a no-op for non-prefixed
                 # names, so harness tools still fall through to the pure/mixed
@@ -1199,14 +1391,18 @@ async def _dispatch_intercepts(ctx: PipelineCtx, pipeline: list) -> PipelineCtx:
             return ctx
 
         # All claimed by intercept plugins — execute them, splice results,
-        # and re-call the resource step.
-        if lap >= max_laps:
+        # and re-call the resource step. The runaway guardrail only fires for a
+        # finite cap; an uncapped identity (max_tool_laps: 0) runs until the
+        # model stops calling tools — the never-leak guard still protects the
+        # mixed-frame case above, so uncapped is safe.
+        if not uncapped and lap >= max_laps:
             logger.warning(
                 f"Identity '{ctx.identity.key}' — handle_tool_calls "
-                f"max_laps={max_laps} reached and upstream STILL returned "
+                f"max_tool_laps={max_laps} reached and upstream STILL returned "
                 f"tool_calls. Neutralizing unresolved bridge tool_calls "
                 f"(they must never reach the harness) and delivering. Raise "
-                f"BRIDGE_HANDLE_TOOL_CALLS_MAX_LAPS to allow more laps."
+                f"this identity's max_tool_laps (or set 0 for uncapped) to "
+                f"allow more laps."
             )
             _neutralize_bridge_tool_calls(ctx, intercept_tuples)
             return ctx
@@ -1234,17 +1430,29 @@ async def _dispatch_intercepts(ctx: PipelineCtx, pipeline: list) -> PipelineCtx:
         ]
         ctx.response = None
 
+        # Breadcrumb for the save side (basic_session.observe_response): a
+        # bridge-owned tool loop actually executed at least one lap, so the
+        # spliced [assistant(tool_calls), tool(result)…] turns now live on
+        # ctx.request.messages. Without this flag the save path can't tell a
+        # bridge-owned loop from a plain turn and stores ONLY the final reply
+        # (the agent's history becomes a "theatre script, not a lab notebook").
+        # The flag lets basic_session take its existing full-exchange storage
+        # path (the one harness-owned loops already use), preserving the real
+        # tool_calls + results + the agent's mid-loop narration.
+        ctx.plugin_data["intercept.loop_ran"] = True
+
         # Re-call the resource step. ctx.request.stream is already False
         # from the pre-delivery branch decision; keep it that way.
+        cap_label = "∞" if uncapped else str(max_laps + 1)
         if ctx.dev_trace is not None:
             dev_trace.event(
                 ctx.dev_trace, "intercept_recall",
-                lap=lap + 1, max_laps=max_laps,
+                lap=lap + 1, max_laps=("uncapped" if uncapped else max_laps),
                 claimed_tool_count=sum(len(c) for _, _, _, c in plugin_claims),
                 claimants=[_short_name(p) for p, _, _, _ in plugin_claims],
             )
         ctx.slots_visited.append(
-            f"[core] intercept lap {lap + 1}/{max_laps + 1} "
+            f"[core] intercept lap {lap + 1}/{cap_label} "
             f"({sum(len(c) for _, _, _, c in plugin_claims)} tool_call(s) "
             f"executed; re-calling resource)"
         )
@@ -1259,6 +1467,7 @@ async def _dispatch_intercepts(ctx: PipelineCtx, pipeline: list) -> PipelineCtx:
             )
             return ctx
         ctx = resource_result
+        lap += 1
 
     return ctx
 
@@ -1315,17 +1524,48 @@ def _plugin_owned_tools(plugin: Any) -> list[str]:
     return [t for t in owned if isinstance(t, str) and t]
 
 
-def _max_intercept_laps() -> int:
-    """How many extra resource-step calls are permitted per request.
-    Default 1 (one re-call after the initial resource step). Configurable
-    via BRIDGE_HANDLE_TOOL_CALLS_MAX_LAPS for sub-agent / multi-pass
-    scenarios. Q-L parks the per-plugin / per-config-block alternatives."""
-    raw = os.getenv("BRIDGE_HANDLE_TOOL_CALLS_MAX_LAPS", "1")
+def _coerce_laps(raw: object) -> int | None:
+    """Parse a ``max_tool_laps`` value into a non-negative int, or None if it
+    isn't a usable integer. ``0`` is preserved (it means *uncapped*) — only
+    negative values are clamped (to 0 / uncapped, since a negative bound is
+    meaningless and 'no bound' is the closest honest reading)."""
     try:
-        n = int(raw)
-        return max(1, n)
+        n = int(raw)  # type: ignore[arg-type]
     except (TypeError, ValueError):
-        return 1
+        return None
+    return max(0, n)
+
+
+def _resolve_max_tool_laps(
+    identity_cfg: dict,
+    role_cfg: dict,
+    session_cfg: dict,
+    resource_cfg: dict,
+    server_cfg: dict,
+) -> int:
+    """Resolve the agentic-tool-loop runaway guardrail top-down.
+
+    ``max_tool_laps`` is a bare scalar config key (like ``timezone``), not a
+    plugin. Cascade order matches the rest of the bridge:
+    ``identity > role > session > resource > server > .env``. First level that
+    declares an integer wins; ``0`` is a valid winning value meaning *uncapped*
+    (run until ``finish_reason != tool_calls``). If no level declares it, fall
+    back to the legacy ``BRIDGE_HANDLE_TOOL_CALLS_MAX_LAPS`` env var, then to 1.
+
+    This is a runaway/cost guardrail, NOT a feature leash — the never-leak
+    guard (``_neutralize_bridge_tool_calls``) already makes an unbounded model
+    safe by stripping unresolved bridge tool_calls before delivery."""
+    for cfg in (identity_cfg, role_cfg, session_cfg, resource_cfg, server_cfg):
+        if not isinstance(cfg, dict) or "max_tool_laps" not in cfg:
+            continue
+        n = _coerce_laps(cfg.get("max_tool_laps"))
+        if n is not None:
+            return n
+    # Legacy env fallback (absolute bottom of the cascade).
+    env_n = _coerce_laps(os.getenv("BRIDGE_HANDLE_TOOL_CALLS_MAX_LAPS"))
+    if env_n is not None:
+        return env_n
+    return 1
 
 
 def _extract_intercept_inputs(
@@ -1409,7 +1649,7 @@ def _build_assistant_turn_from_response(ctx: PipelineCtx) -> dict:
     """Build the assistant message dict that gets spliced into messages
     before the tool_results, so the re-call sees: [..., assistant_turn,
     tool_result_1, tool_result_2, ...]. Preserves tool_calls, content,
-    reasoning_content (Moonshot fix per project_moonshot_reasoning.md)."""
+    reasoning_content (Moonshot fix)."""
     _fr, _tcs, message = _extract_intercept_inputs(ctx)
     turn: dict[str, Any] = {"role": "assistant"}
     content = message.get("content")
@@ -1454,7 +1694,7 @@ def _claimed_with_clean_name(tc: dict) -> dict:
     """Return a shallow copy of the claimed tool_call with the bridge_native__
     prefix stripped from function.name, so the plugin's clean OWNED_TOOLS-keyed
     handler lookup resolves. The ORIGINAL tc (prefixed) must be preserved for
-    the assistant turn and tool result message the buddy sees in history — so we
+    the assistant turn and tool result message the agent sees in history — so we
     never mutate it; we hand the plugin this normalised copy only. No-op (returns
     the original) for non-prefixed names or malformed entries."""
     if not isinstance(tc, dict):

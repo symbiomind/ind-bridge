@@ -25,10 +25,16 @@ Two knobs, one honest meaning each:
 
 Reset is OFF by default. A fresh session happens only when the file is gone/empty —
 **deleting the session file is the always-available hard reset.** Opt into a soft
-boundary with ``session_reset`` (``daily`` rolls at a configured time; ``manual``
-resets on an explicit header). A soft reset does NOT delete the file — it stamps
-``is_new`` for the wake cascade and starts a fresh send-window; trim stays governed by
-the (non-existent) storage limit, i.e. nothing is lost.
+boundary with ``session_reset``:
+
+  * ``daily`` — a background scheduler (``start_background``) archives the session
+    file at the configured wall-clock ``at`` time (renames it to a dated copy
+    beside it; nothing is destroyed). The next read sees no file and takes the
+    always-on fresh path, so the wake cascade fires for the *human's* first turn of
+    the day — not for whatever cron/heartbeat happened to write the file overnight.
+    This is event-driven on purpose: a read-time mtime heuristic could be raced by a
+    mid-day write that bumped the file past the boundary and ate the reset.
+  * ``manual`` — resets on an explicit ``x-session-reset`` header.
 
 This plugin lives WHOLLY in one ``sessions.<name>.plugins`` block (D-010 lets
 ``post_response`` sit in ``session.plugins`` alongside ``outbound_params``):
@@ -38,7 +44,9 @@ This plugin lives WHOLLY in one ``sessions.<name>.plugins`` block (D-010 lets
         plugins:
           basic_session:
             max_turns: 20                    # SEND window; false/0 = send all. Storage is always full.
-            data_dir: data/basic_session     # session file location (default as shown)
+            data_dir: data/basic_session     # parent dir (default as shown); each
+                                             # session is stored under its own subfolder:
+                                             # <data_dir>/<session_key>/<session_key>.json
             system_prompt:                   # optional file list — replaces upstream system
               - /workspace/my_agent/SOUL.md
             system_prompt_append: "..."      # optional string appended to whatever system is used
@@ -66,6 +74,9 @@ Capabilities / lifecycle:
     wakeup cascade.
   * ``post_response`` (``observe_response``) — fires after delivery, fire-and-forget;
     sees only the final, *closed* assistant turn.
+  * ``background`` (``start_background``) — spawned once at startup per identity that
+    wires this plugin; schedules the ``session_reset.mode: daily`` archive (no task
+    for ``manual``/``never``).
 
 Tool-calling, two ownerships:
   * **Bridge-owned** tools (``handle_tool_calls`` plugins) — the executor owns the
@@ -76,11 +87,12 @@ Tool-calling, two ownerships:
     detects this (tail after the last user turn carries tool/assistant-tool_calls
     messages) and splices the tail through VERBATIM, or the model never sees the tool
     ran and re-calls it forever. When the loop closes, ``observe_response`` stores the
-    FULL exchange so the buddy's memory records that it ran the tool.
+    FULL exchange so the agent's memory records that it ran the tool.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -89,7 +101,7 @@ from datetime import datetime, time as dt_time, timedelta
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from app.context import PipelineCtx
+    from app.context import PipelineCtx, StartupCtx
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +109,7 @@ logger = logging.getLogger(__name__)
 CAPABILITIES = {
     "outbound_params": ["session.plugins"],   # load + rebuild + stamp session_state
     "post_response":   ["session.plugins"],   # save the closed turn, after delivery (D-010)
+    "background":      ["session.plugins"],   # schedule the daily reset-archive (mode: daily)
 }
 
 
@@ -108,9 +121,16 @@ _MANUAL_RESET_HEADER = "x-session-reset"
 
 # Rich assistant fields preserved on save so replay survives picky providers.
 # Reasoning key varies by provider: Moonshot → reasoning_content; OpenRouter →
-# reasoning (+ reasoning_details). tool_calls is preserved for completeness, though
-# the loop-not-closed guard skips saving turns that still carry one.
-_RICH_KEYS = ("reasoning_content", "reasoning", "reasoning_details", "tool_calls")
+# reasoning. tool_calls is preserved for completeness, though the loop-not-closed
+# guard skips saving turns that still carry one.
+#
+# NOTE: `reasoning_details` (OpenRouter's per-token structured array) is
+# DELIBERATELY NOT stored. OpenRouter sends reasoning twice — the concatenated
+# `reasoning` string AND a per-token array — for provider compatibility. We only
+# need the completed artifact once (OpenAI-protocol storage), and nothing reads
+# the array structure back; it just bloats session files to 300k+ lines. The
+# WIRE/streaming paths still relay the array; the drop is storage-only.
+_RICH_KEYS = ("reasoning_content", "reasoning", "tool_calls")
 
 
 # ---------------------------------------------------------------------------
@@ -152,7 +172,7 @@ def apply_outbound_params(ctx: "PipelineCtx", config: dict) -> "PipelineCtx":
     sent_history = _tool_group_safe_window(history, max_messages)
 
     # Optional: fold OLD tool exchanges to assistant prose on the wire (storage
-    # untouched). Keeps the most-recent closed exchange raw so the buddy can
+    # untouched). Keeps the most-recent closed exchange raw so the agent can
     # still reason from fresh tool results; older groups collapse to one
     # assistant message with paired <tool type="call|result" name="…"> tags so
     # the toolbelt-breadcrumb survives but old (possibly harness-truncated)
@@ -172,30 +192,37 @@ def apply_outbound_params(ctx: "PipelineCtx", config: dict) -> "PipelineCtx":
     new_messages: list[dict] = []
     if system_content:
         new_messages.append({"role": "system", "content": system_content})
-    new_messages.extend(sent_history)
 
     if in_tool_loop:
-        # Splice the entire user→tool tail through verbatim so the model sees
-        # its own tool_calls + the matching results. assemble_and_sign (step 4)
-        # later injects the bridge_context into the LAST user message of the
-        # working copy — which is the tail's user turn — so signing still works.
-        #
-        # NOTE: a tail ending in an unanswered assistant(tool_calls) is the LIVE
-        # in-flight call — it MUST pass through so the harness/model loop can run
-        # the tool and append the result. (We previously DROPPED it as a "400
-        # repair" — that ate the call and caused an infinite loop: dropped call →
-        # model re-calls → dropped again → ∞. The 400 it was avoiding is a
-        # DIFFERENT, narrower case; never delete the live call. See
-        # notes/DESIGN-transparent-harness-tool-loops.md.)
-        new_messages.extend(tail)
+        # TRANSPARENCY (Option A, DESIGN-transparent-harness-tool-loops.md).
+        # The HARNESS owns this tool loop and re-hit us with a coherent, complete
+        # thread. The bridge's job here is a CLEAN PIPE: prepend our system, then
+        # forward the harness's own messages — do NOT Frankenstein
+        # [stored_history] + [spliced tail]. The old splice substituted the
+        # bridge's prose store (0 tool turns) for the part of the thread BEFORE
+        # the last user turn, which orphaned tool groups whose call sat in the
+        # tail but whose result sat in the windowed-out store (or vice-versa).
+        # That orphan is exactly the trailing-unanswered-tool_call a strict
+        # provider (Moonshot) 400s on — a wound the bridge inflicted by NOT being
+        # transparent. Passing the inbound through keeps every tool group intact
+        # and sidesteps LibreChat's non-unique ``:0`` tool_call_ids (no slicing →
+        # no pairing to get wrong). We strip the harness's own system message
+        # (we supply ours / bridge_context); assemble_and_sign still injects into
+        # the LAST user message, which the full inbound still carries.
+        new_messages.extend(_strip_system_messages(inbound))
+        # loop_tail (for the save side) stays the user→tool tail, unchanged.
         ctx.plugin_data["basic_session.in_tool_loop"] = True
         ctx.plugin_data["basic_session.loop_tail"] = tail
         logger.info(
             f"basic_session: '{session_key}' — harness tool-loop, "
-            f"splicing {len(tail)} tail message(s) through verbatim"
+            f"passing {len(inbound)} inbound message(s) through transparently "
+            f"(clean pipe; no stored-history substitution)"
         )
     else:
-        latest_user = _extract_latest_user_message(inbound)
+        new_messages.extend(sent_history)
+        # SEND path: preserve multi-part content (image_url etc.) verbatim so the
+        # model actually receives the image. (Storage still flattens — line ~312.)
+        latest_user = _extract_latest_user_message(inbound, flatten=False)
         if latest_user is not None:
             new_messages.append(latest_user)
 
@@ -223,7 +250,7 @@ def observe_response(ctx: "PipelineCtx", config: dict) -> None:
     closed assistant turn. Stores *rich* assistant fields (reasoning /
     tool_calls) so replay survives picky providers. When a harness tool-loop
     closes, stores the FULL exchange (user + tool turns + final text) so the
-    buddy's memory records that it actually ran the tool."""
+    agent's memory records that it actually ran the tool."""
     session_file = ctx.plugin_data.get("basic_session.file")
     session_key = ctx.plugin_data.get("basic_session.key", "?")
     if not session_file:
@@ -246,7 +273,7 @@ def observe_response(ctx: "PipelineCtx", config: dict) -> None:
 
     # We store the WORKING-copy user turn — i.e. WITH the bridge_context the
     # bridge injected this turn (caller + that turn's recalled memories). This is
-    # what the buddy actually saw, so replaying it is the buddy's faithful memory.
+    # what the agent actually saw, so replaying it is the agent's faithful memory.
     # Safe and not bloat:
     #   1. bridge_sign.verify_inbound only verifies the LAST user message and
     #      returns — never re-walks history — so a stored signed block is never
@@ -256,11 +283,26 @@ def observe_response(ctx: "PipelineCtx", config: dict) -> None:
     #      history is the ONLY copy — storing clean would lose it (a memory gap).
     history = _load_history(session_file)
 
-    if ctx.plugin_data.get("basic_session.in_tool_loop"):
-        # Harness tool-loop just CLOSED (assistant_turn is final text). Persist
-        # the full exchange so the buddy remembers running the tool:
+    # Two ways a tool-loop tail ends up on the working copy at save time:
+    #   * in_tool_loop      — HARNESS-owned: the inbound request already carried
+    #                         [user, assistant(tool_calls), tool(result)…] (set at
+    #                         load by _contains_tool_loop_messages).
+    #   * intercept.loop_ran — BRIDGE-owned: the executor's handle_tool_calls /
+    #                         mcp_client loop spliced the tool turns onto
+    #                         ctx.request.messages mid-request (set in
+    #                         pipeline_executor._dispatch_intercepts).
+    # Either way the working-copy tail is [user, assistant(tool_calls),
+    # tool(result)…] and we persist the FULL exchange — the real tool_calls +
+    # results + the agent's mid-loop narration — so its history is a lab
+    # notebook, not a theatre script. _loop_exchange_to_store is agnostic to who
+    # owned the loop (it just walks the tail from the last user turn).
+    in_tool_loop = ctx.plugin_data.get("basic_session.in_tool_loop")
+    bridge_loop_ran = ctx.plugin_data.get("intercept.loop_ran")
+    if in_tool_loop or bridge_loop_ran:
+        # Tool-loop just CLOSED (assistant_turn is final text). Persist the full
+        # exchange so the agent remembers running the tool:
         #   user + assistant(tool_calls) + tool(result)… + final assistant(text)
-        # The user turn + the harness tool turns come from the working-copy tail
+        # The user turn + the tool turns come from the working-copy tail
         # (= ctx.request.messages, which carries the bridge_context on its user
         # turn from assemble_and_sign). The final text turn comes from ctx.response.
         loop_messages = _loop_exchange_to_store(ctx.request.messages)
@@ -269,9 +311,10 @@ def observe_response(ctx: "PipelineCtx", config: dict) -> None:
         history.extend(loop_messages)
         history.append(assistant_turn)
         _save_history(session_file, history)
+        owner = "harness" if in_tool_loop else "bridge"
         logger.info(
-            f"basic_session: '{session_key}' — tool-loop closed, saved full "
-            f"exchange ({len(loop_messages)} tool message(s) + reply), "
+            f"basic_session: '{session_key}' — {owner}-owned tool-loop closed, "
+            f"saved full exchange ({len(loop_messages)} tool message(s) + reply), "
             f"history now {len(history)} message(s)"
         )
         return
@@ -290,13 +333,184 @@ def observe_response(ctx: "PipelineCtx", config: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# background — schedule the daily reset-archive (mode: daily)
+# ---------------------------------------------------------------------------
+
+def start_background(ctx: "StartupCtx", config: dict):
+    """Schedule the daily session-reset archive for ``session_reset.mode: daily``.
+
+    Returns a runner coroutine (cron-style sleeper loop) that, at the configured
+    wall-clock boundary, renames the session file to a dated archive beside it,
+    labelled with the DAY THAT JUST ENDED (not the boundary morning) so the
+    filename date matches the content — e.g. a 04:00 reset on 2026-06-15 renames
+    ``agent.json`` → ``agent.2026-06-14T0400.json`` (June 14's turns). The next read sees no file
+    → the always-on ``not history → fresh_file`` path stamps ``is_new`` →
+    conversational_memory wipes shown-state and fires the wakeup cascade.
+
+    Returns ``None`` (no task spawned) for ``manual`` / ``never`` / no reset — those
+    modes don't need a scheduler. Core (`server._spawn_background_tasks`) calls this
+    once per identity that wires basic_session on a slot, with the cascade-merged
+    ``basic_session`` config.
+    """
+    reset_cfg = (config or {}).get("session_reset") or {}
+    mode = (reset_cfg.get("mode") or "never").lower()
+    if mode != "daily":
+        return None  # only `daily` needs an out-of-band scheduler
+
+    # Resolve the session file path at startup from the cascade (no request ctx
+    # here). basic_session's key IS the named session block — resolve_cascade
+    # gives us the identity's role→session name.
+    from app import cascade as cascade_mod
+
+    cascade = cascade_mod.resolve_cascade(ctx.identity_key)
+    session_key = cascade.session_key if cascade else None
+    if not session_key:
+        logger.warning(
+            f"basic_session: identity '{ctx.identity_key}' has session_reset.mode=daily "
+            f"but no resolvable session name — no reset scheduled."
+        )
+        return None
+    session_file = _session_file(_sanitise_key(session_key), config)
+
+    # Boundary 'HH:MM' → a daily cron expression in the resolved tz.
+    # Resolution order (most specific wins): a `timezone:` on this session_reset
+    # block → an identity-level hint → the global `server.timezone` → UTC. Any
+    # plugin that needs a tz follows this same ladder, so a future bridge with
+    # per-session timezones (different sessions on different clocks) just sets
+    # `session_reset.timezone` and the bridge honours it — it doesn't care why.
+    at = _parse_hhmm(reset_cfg.get("at", "04:00"))
+    cron_expr = f"{at.minute} {at.hour} * * *"
+    tz_name = (
+        reset_cfg.get("timezone")
+        or _identity_timezone(ctx.identity_cfg)
+        or (ctx.server_cfg or {}).get("timezone")
+        or "UTC"
+    )
+
+    # Validate the expr loud at startup, like cron does.
+    try:
+        from croniter import croniter
+        if not croniter.is_valid(cron_expr):
+            raise ValueError("invalid cron expression")
+    except ImportError:
+        logger.error(
+            "basic_session: the 'croniter' package is not installed — daily reset "
+            "disabled. It's declared in the bridge's main requirements.txt."
+        )
+        return None
+    except Exception as e:
+        logger.warning(
+            f"basic_session: identity '{ctx.identity_key}' bad daily-reset boundary "
+            f"'{reset_cfg.get('at')}' ({e}) — no reset scheduled."
+        )
+        return None
+
+    logger.info(
+        f"basic_session: identity '{ctx.identity_key}' daily reset-archive scheduled "
+        f"'{cron_expr}' [{tz_name}] for session '{session_key}'"
+    )
+    return _run_reset_loop(ctx.identity_key, session_key, session_file, cron_expr, tz_name)
+
+
+async def _run_reset_loop(
+    identity_key: str, session_key: str, session_file: str, cron_expr: str, tz_name: str
+) -> None:
+    """Sleep until the next boundary, archive the session file, repeat. One bad
+    fire is logged and swallowed; the loop continues. CancelledError re-raises
+    for clean shutdown (mirrors cron's runner)."""
+    from croniter import croniter
+
+    tz = _resolve_tz(tz_name)
+    while True:
+        now = datetime.now(tz)
+        nxt = croniter(cron_expr, now).get_next(datetime)
+        delay = max(0.0, (nxt - now).total_seconds())
+        logger.debug(
+            f"basic_session: reset for '{session_key}' next fire at {nxt.isoformat()} "
+            f"(in {delay:.0f}s)"
+        )
+        try:
+            await asyncio.sleep(delay)
+            _archive_session_file(session_key, session_file, tz)
+        except asyncio.CancelledError:
+            logger.info(
+                f"basic_session: reset loop for '{session_key}' cancelled — shutting down"
+            )
+            raise
+        except Exception as e:
+            logger.error(
+                f"basic_session: reset for '{session_key}' (identity '{identity_key}') "
+                f"tick error — {e!r} — loop continues.",
+                exc_info=True,
+            )
+
+
+def _archive_session_file(session_key: str, session_file: str, tz) -> None:
+    """Rename the live session file to a dated archive beside it. No file = the
+    reset already effectively happened (a hard delete, or nothing spoken yet);
+    nothing to do."""
+    if not os.path.exists(session_file):
+        logger.info(
+            f"basic_session: reset for '{session_key}' — no session file to archive "
+            f"(already fresh); skipping."
+        )
+        return
+    # Label the archive with the DAY THAT JUST ENDED, not the boundary morning.
+    # The reset fires at ~04:00, but the conversation inside is yesterday's day —
+    # so we back up to the previous calendar day. This keeps the filename date
+    # honest (a file named 2026-07-01 holds July 1's turns) for humans and any
+    # date-eyeballing downstream. The time portion stays the boundary wall-clock.
+    now = datetime.now(tz)
+    stamp = f"{(now - timedelta(days=1)).strftime('%Y-%m-%d')}T{now.strftime('%H%M')}"
+    root, ext = os.path.splitext(session_file)
+    archive_path = f"{root}.{stamp}{ext}"
+    # Avoid clobbering a same-minute archive (e.g. a manual fire + the scheduled one).
+    if os.path.exists(archive_path):
+        archive_path = f"{root}.{stamp}.{int(now.timestamp())}{ext}"
+    os.rename(session_file, archive_path)
+    logger.info(
+        f"basic_session: reset for '{session_key}' — archived session to "
+        f"'{os.path.basename(archive_path)}'; next read is a fresh session."
+    )
+
+
+def _identity_timezone(identity_cfg: dict | None) -> str | None:
+    """Best-effort identity-level tz hint — a `timezone:` directly on the identity,
+    or under context.additional. Mirrors cron's `_identity_timezone`. We don't have
+    ctx.timezone at startup (that's a PipelineCtx field), so this is one rung of the
+    ladder: session_reset.timezone → identity hint → server.timezone → UTC."""
+    if not isinstance(identity_cfg, dict):
+        return None
+    tz = identity_cfg.get("timezone")
+    if tz:
+        return str(tz)
+    context = identity_cfg.get("context") or {}
+    additional = context.get("additional") or {}
+    tz = additional.get("timezone")
+    return str(tz) if tz else None
+
+
+# ---------------------------------------------------------------------------
 # Reset policy — never (default) | daily | manual
 # ---------------------------------------------------------------------------
+#
+# `daily` is EVENT-driven, not read-driven. A background scheduler
+# (`start_background`, below) archives the session file at the configured
+# wall-clock boundary; the next read then hits the always-on empty-file path
+# (`not history → fresh_file`) and conversational_memory wakes the cascade off
+# `session_state.is_new`. This deliberately replaced the old mtime-comparison
+# heuristic: a cron/heartbeat turn that writes the session file mid-day used to
+# bump the mtime past the boundary and silently consume the reset before the
+# human's morning turn. An event can't be raced that way — the archive either
+# happened or it didn't. (The gap is a feature: the boundary is a ritual the
+# agent's pre-gap reflection can prepare for.) `_check_reset` therefore only
+# handles `manual` now; `daily`/`never` are continuations here.
 
 def _check_reset(ctx: "PipelineCtx", session_file: str, config: dict) -> tuple[bool, str]:
     """For a non-empty session, decide whether a configured soft reset makes
-    it fresh. Returns (is_new, reason). Default (no/`never` config) is a
-    continuation."""
+    it fresh on THIS read. Returns (is_new, reason). Only ``manual`` resets on
+    a read (via header); ``daily`` is handled out-of-band by the archive
+    scheduler, and ``never`` (default) is always a continuation."""
     reset_cfg = config.get("session_reset") or {}
     mode = (reset_cfg.get("mode") or "never").lower()
 
@@ -306,35 +520,7 @@ def _check_reset(ctx: "PipelineCtx", session_file: str, config: dict) -> tuple[b
             return True, "manual_reset"
         return False, "continuation"
 
-    if mode == "daily":
-        if _crossed_daily_boundary(session_file, reset_cfg, ctx.timezone):
-            return True, "daily_reset"
-        return False, "continuation"
-
     return False, "continuation"
-
-
-def _crossed_daily_boundary(session_file: str, reset_cfg: dict, timezone: str) -> bool:
-    """True if the most recent daily-reset boundary (e.g. 04:00) falls between
-    the session file's last write and now. The boundary is a wall-clock time
-    in the server timezone; we compare against the file mtime so a session
-    that last spoke yesterday-evening wakes fresh after the next 4am rolls by."""
-    at = _parse_hhmm(reset_cfg.get("at", "04:00"))
-    tz = _resolve_tz(timezone)
-
-    try:
-        mtime = os.path.getmtime(session_file)
-    except OSError:
-        return False  # no file to compare — empty-history path already handled it
-
-    now = datetime.now(tz)
-    last = datetime.fromtimestamp(mtime, tz)
-
-    # Most recent boundary at-or-before now.
-    boundary_today = now.replace(hour=at.hour, minute=at.minute, second=0, microsecond=0)
-    last_boundary = boundary_today if now >= boundary_today else boundary_today - timedelta(days=1)
-
-    return last < last_boundary
 
 
 # ---------------------------------------------------------------------------
@@ -401,9 +587,15 @@ def _sanitise_key(key: str) -> str:
 
 
 def _session_file(session_key: str, config: dict) -> str:
+    """Path to a session's live file, nested under its OWN subfolder:
+    ``<data_dir>/<session_key>/<session_key>.json``. The folder boundary makes
+    each agent's session (live file + dated archives + .bak siblings, which all
+    land beside it) a clean per-agent mount target. ``session_key`` is already
+    ``_sanitise_key``'d at both call sites, so it's filesystem-safe as a dir name."""
     data_dir = config.get("data_dir", _DEFAULT_DATA_DIR)
-    os.makedirs(data_dir, exist_ok=True)
-    return os.path.join(data_dir, f"{session_key}.json")
+    session_dir = os.path.join(data_dir, session_key)
+    os.makedirs(session_dir, exist_ok=True)
+    return os.path.join(session_dir, f"{session_key}.json")
 
 
 def _resolve_max_turns(config: dict) -> int | None:
@@ -444,13 +636,29 @@ def _save_history(path: str, history: list[dict]) -> None:
 # Message extraction / assembly
 # ---------------------------------------------------------------------------
 
-def _extract_latest_user_message(messages: list[dict]) -> dict | None:
-    """Return the last user message as a clean ``{"role": "user", "content": ...}``
-    dict (multi-part vision content flattened to text). None if absent."""
+def _extract_latest_user_message(
+    messages: list[dict], flatten: bool = True
+) -> dict | None:
+    """Return the last user message as a clean ``{"role": "user", "content": ...}`` dict.
+
+    ``flatten=True`` (default, used on the SAVE path): multi-part vision content is
+    collapsed to its text parts — storage stays text-only for now (the full
+    multimodal-session shape is a separate, parked design question). Returns None
+    if there's no text to store.
+
+    ``flatten=False`` (used on the SEND/wire path): multi-part content is preserved
+    VERBATIM so image_url / other parts reach the model. Without this the wire
+    rebuild would silently drop the image — the agent receives text only and
+    "sees nothing" (the LibreChat/curl image leak, diagnosed 2026-06-21: the bridge
+    RECEIVED the image but this extractor flattened it off the wire)."""
     for msg in reversed(messages):
         if msg.get("role") == "user":
             content = msg.get("content", "")
             if isinstance(content, list):
+                if not flatten:
+                    # Preserve the multi-part content verbatim (keeps image_url etc.).
+                    # Empty only if there are literally no parts.
+                    return {"role": "user", "content": content} if content else None
                 parts = [p.get("text", "") for p in content if p.get("type") == "text"]
                 text = " ".join(parts).strip()
             else:
@@ -465,6 +673,15 @@ def _extract_system(messages: list[dict]) -> str | None:
             content = msg.get("content", "")
             return str(content).strip() or None
     return None
+
+
+def _strip_system_messages(messages: list[dict]) -> list[dict]:
+    """Return ``messages`` without any ``system`` turns. Used by the transparent
+    harness-tool-loop path: the bridge supplies its OWN system prompt (built from
+    config + bridge_context), so the harness's system message must not leak a
+    second one into the forwarded thread. Non-system turns pass through verbatim
+    (tool groups intact)."""
+    return [m for m in messages if m.get("role") != "system"]
 
 
 # ---------------------------------------------------------------------------
@@ -517,8 +734,28 @@ def _loop_exchange_to_store(messages: list[dict]) -> list[dict]:
         role = msg.get("role")
         if role == "assistant" and not msg.get("tool_calls"):
             continue  # skip any stray plain-text assistant turn; reply comes from ctx.response
-        out.append(msg)
+        out.append(_strip_stored_reasoning_details(msg))
     return out
+
+
+def _strip_stored_reasoning_details(msg: dict) -> dict:
+    """Drop the per-token `reasoning_details` array from a turn before storage.
+    The spliced assistant(tool_calls) turns on the working copy carry it because
+    the executor put it there for the WIRE re-call (see
+    pipeline_executor._build_assistant_turn_from_response). Storage only needs
+    the completed `reasoning`/`reasoning_content` string artifact — the array is
+    bloat nothing reads back (same rule as _RICH_KEYS / the final turn). Returns
+    a shallow copy so the wire copy in ctx.request.messages stays untouched."""
+    if not isinstance(msg, dict) or "reasoning_details" not in msg:
+        return msg
+    cleaned = dict(msg)
+    # Preserve the thinking text if no string key survived (array-only edge case).
+    if not cleaned.get("reasoning") and not cleaned.get("reasoning_content"):
+        collapsed = _collapse_reasoning_details(cleaned.get("reasoning_details"))
+        if collapsed:
+            cleaned["reasoning"] = collapsed
+    cleaned.pop("reasoning_details", None)
+    return cleaned
 
 
 def _tool_group_safe_window(history: list[dict], max_messages: int) -> list[dict]:
@@ -549,13 +786,13 @@ def _tool_group_safe_window(history: list[dict], max_messages: int) -> list[dict
 # Storage stays rich; the wire gets a windowed, optionally-folded view. Same
 # shape as max_turns (full storage, windowed wire), one rung up. The fold turns
 # OLD assistant(tool_calls) + tool(result) groups into a SINGLE assistant
-# message carrying paired <tool type="call|result" name="…"> tags — the buddy
+# message carrying paired <tool type="call|result" name="…"> tags — the agent
 # still infers its own toolbelt from past calls, while the wire stops dragging
 # old (possibly harness-truncated) plumbing turn-over-turn.
 #
 # Invariants (load-bearing, see TestDegradeToolHistory):
 #   * Fold names ONLY the bare tool ``name`` from the OpenAI tool_calls payload.
-#     NEVER harness/MCP-server/source labels. Buddies are harness-portable; the
+#     NEVER harness/MCP-server/source labels. Agents are harness-portable; the
 #     fold MUST NOT leak which harness or server produced the turn.
 #   * ``truncated="harness"`` is the ONLY hint about lossiness, set when the
 #     result content contains ``[truncated:`` (harness left its marker). Honest
@@ -664,6 +901,21 @@ def _escape_attr(value: str) -> str:
     )
 
 
+def _collapse_reasoning_details(details: object) -> str | None:
+    """Join an OpenRouter `reasoning_details` array down to its text. Used only
+    when the provider sent the structured array but no reasoning string, so the
+    thinking text survives without storing thousands of per-token entries."""
+    if not isinstance(details, list):
+        return None
+    parts = [
+        entry.get("text")
+        for entry in details
+        if isinstance(entry, dict) and isinstance(entry.get("text"), str)
+    ]
+    joined = "".join(p for p in parts if p)
+    return joined or None
+
+
 def _build_rich_assistant_turn(response: dict | None) -> dict | None:
     """Build the assistant turn to persist from ctx.response. Stores rich
     fields (reasoning_content, tool_calls) when the provider returned them so
@@ -683,12 +935,22 @@ def _build_rich_assistant_turn(response: dict | None) -> dict | None:
     turn: dict = {"role": "assistant", "content": message.get("content")}
     # Preserve rich fields verbatim so replay survives picky providers. Reasoning
     # arrives under different keys per provider — Moonshot uses `reasoning_content`,
-    # OpenRouter uses `reasoning` (+ `reasoning_details`). Keep whatever was sent;
-    # don't normalise (replaying the same key the provider gave us is the safe bet).
+    # OpenRouter uses `reasoning`. Keep whatever was sent; don't normalise
+    # (replaying the same key the provider gave us is the safe bet). The per-token
+    # `reasoning_details` array is intentionally excluded from _RICH_KEYS (see note
+    # there) — storage keeps the completed string artifact only.
     for rich_key in _RICH_KEYS:
         val = message.get(rich_key)
         if val:
             turn[rich_key] = val
+
+    # Edge case: provider sent ONLY the structured array (no reasoning string).
+    # Collapse it to a joined string so no thinking text is lost, then leave the
+    # array unstored. (OpenRouter normally sends both, so this rarely fires.)
+    if not turn.get("reasoning") and not turn.get("reasoning_content"):
+        collapsed = _collapse_reasoning_details(message.get("reasoning_details"))
+        if collapsed:
+            turn["reasoning"] = collapsed
 
     # Nothing to say AND no tool call — not worth persisting.
     if not turn.get("content") and not turn.get("tool_calls"):

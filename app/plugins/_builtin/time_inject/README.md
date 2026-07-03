@@ -1,12 +1,12 @@
 # time_inject
 
 Injects the current friendly local time into `<bridge_context>`. Solves UTC
-confusion for buddies that need to know the correct local time.
+confusion for agents that need to know the correct local time.
 
 Output (a key in `ctx.bridge_context`, which core renders as an XML tag):
 
 ```xml
-<current_time>Wednesday, 1st April 2026 - 09:14 AM ACDT</current_time>
+<current_time>Wednesday, 1st April 2026 - 09:14 AM EDT</current_time>
 ```
 
 ## Capabilities
@@ -23,7 +23,7 @@ roles:
     context:
       plugins:
         time_inject:
-          timezone: Australia/Adelaide   # optional
+          timezone: America/New_York     # optional
 ```
 
 `timezone:` is optional. Resolution order (highest wins):

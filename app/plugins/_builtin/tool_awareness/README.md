@@ -2,7 +2,7 @@
 
 Keeps an AI agent **aware of its current tools**. On a bridge-owned session
 (Shape 4) the harness/client can be switched mid-session (OpenClaw → LibreChat →
-NemoClaw); buddies then keep inferring the **first** harness's tools even when
+NemoClaw); agents then keep inferring the **first** harness's tools even when
 told otherwise.
 
 That's a model-**training** limitation, not a bridge bug — the bridge can present

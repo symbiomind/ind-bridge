@@ -2,10 +2,10 @@
 time_inject — builtin context_modify plugin (V4).
 
 Injects the current friendly local time into ``<bridge_context>``.
-Solves UTC confusion for buddies that need to know the correct local time.
+Solves UTC confusion for agents that need to know the correct local time.
 
 Config (in identity.context.plugins / role.context.plugins → time_inject):
-  timezone: "Australia/Adelaide"   # any IANA timezone; overrides ctx.timezone if set
+  timezone: "America/New_York"   # any IANA timezone; overrides ctx.timezone if set
 
 Timezone resolution order:
   1. Explicit ``timezone:`` in this plugin's config (highest priority)
@@ -13,8 +13,8 @@ Timezone resolution order:
      (identity → role → session → resource → server → TZ env → UTC)
 
 Output in bridge_context:
-  ctx.bridge_context["current_time"] = "Wednesday, 1st April 2026 - 09:14 AM ACDT"
-  → <current_time>Wednesday, 1st April 2026 - 09:14 AM ACDT</current_time>
+  ctx.bridge_context["current_time"] = "Wednesday, 1st April 2026 - 09:14 AM EDT"
+  → <current_time>Wednesday, 1st April 2026 - 09:14 AM EDT</current_time>
 
 Capability / placement
 ----------------------

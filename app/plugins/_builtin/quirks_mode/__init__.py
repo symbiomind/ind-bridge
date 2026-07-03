@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -96,7 +97,36 @@ _REASONING_KEYS = ("reasoning_content", "reasoning")
 # The canonical set of quirk names. Each maps to one independently-toggleable
 # behaviour below. A name in config (a list, or a models.yml recipe) that isn't
 # here is warned-and-ignored (typo guard).
-_KNOWN_QUIRKS = ("reattach_reasoning", "mirror_reasoning_key", "close_trailing_orphan")
+_KNOWN_QUIRKS = (
+    "reattach_reasoning",
+    "mirror_reasoning_key",
+    "close_trailing_orphan",
+    "tidy_reasoning_whitespace",
+)
+
+# tidy_reasoning_whitespace — collapse stray newlines in REASONING text.
+# Some models (Kimi via OpenRouter, on multi-lap tool turns) stream standalone
+# `\n` tokens between reasoning words — `findMessage` + `\n` + ` with` — and even
+# escalating runs (`\n\n\n\n\n`). The bridge reconstructs them faithfully, so
+# stored/relayed reasoning reads as one-word-per-line. This is the MODEL's output,
+# not a bridge bug — hence a scoped opt-in quirk, not core. The split inserts
+# newlines BETWEEN tokens; the inter-word spaces already live in the tokens, so
+# removing the newline runs (then squeezing doubled spaces) restores the prose.
+# (Same proven rule as tools/clean_session_reasoning.py for legacy files.)
+# Tradeoff: a lone `\n` that was Kimi's ONLY separator makes two words touch
+# (`found3`) — rare and cosmetic; not worth fragile break-detection. ONLY touches
+# reasoning text — never content, never tool_calls.
+_REASONING_NL_RUN = re.compile(r"\n+")
+_REASONING_DBL_SPACE = re.compile(r"[ \t]{2,}")
+
+
+def tidy_reasoning_text(text: str) -> str:
+    """Collapse stray newline runs out of reasoning text (see quirk note above).
+    Pure + idempotent; reused by stream_intercept for the live client relay."""
+    if not text or "\n" not in text:
+        return text
+    return _REASONING_DBL_SPACE.sub(" ", _REASONING_NL_RUN.sub("", text))
+
 
 # The shipped cheat-sheet: model-string → list of quirk names. Lives beside this
 # module; bind-mount your own over it to extend/override without touching code.
@@ -188,7 +218,7 @@ def normalize_outbound(ctx: "PipelineCtx", config: dict) -> "PipelineCtx":
          an unanswered tool call). The result is a plain-language "respond
          normally" instruction — tested loop-safe: the model ANSWERS rather than
          re-calling (a JSON placeholder provokes a re-call; plain instruction
-         does not). This keeps a harness-owned-loop buddy talking instead of
+         does not). This keeps a harness-owned-loop agent talking instead of
          400ing, so we can observe the real harness behaviour.
 
     Each behaviour is independently gated by the resolved quirk set (default-OFF;
@@ -295,7 +325,7 @@ def _close_trailing_orphan(ctx: "PipelineCtx", config: dict) -> None:
         logger.warning(
             f"quirks_mode: closed {len(synthetic)} trailing unanswered "
             f"tool call(s) with a synthetic result for '{_session_key(ctx)}' — "
-            f"in-flight harness call; keeps the buddy responding instead of 400. "
+            f"in-flight harness call; keeps the agent responding instead of 400. "
             f"See DESIGN-harness-client-compensation."
         )
 
@@ -305,10 +335,15 @@ def _close_trailing_orphan(ctx: "PipelineCtx", config: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def observe_response(ctx: "PipelineCtx", config: dict) -> None:
-    """If the just-produced turn carries tool_calls AND reasoning, stash the
-    reasoning keyed by each tool_call_id so a later round-trip can restore it.
-    Only bothers if reattach_reasoning is enabled — no point capturing what we'll
-    never restore."""
+    """Post-response work, each half independently gated:
+      • tidy_reasoning_whitespace — collapse stray newlines in the stored turn's
+        reasoning (mutates ctx.response in place so basic_session, which fires
+        after us, persists the tidied text). Independent of reattach.
+      • reattach_reasoning — stash the turn's reasoning keyed by tool name+args so
+        a later round-trip can restore it (only if that quirk is enabled).
+    """
+    _tidy_stored_reasoning(ctx, config)
+
     if not _enabled(config, "reattach_reasoning"):
         return
     turn = _assembled_turn(ctx)
@@ -392,6 +427,44 @@ def _extract_reasoning(turn: dict) -> str | None:
         if isinstance(val, str) and val:
             return val
     return None
+
+
+def _tidy_stored_reasoning(ctx: "PipelineCtx", config: dict) -> None:
+    """Collapse stray newlines in the just-produced turn's reasoning, in place on
+    ctx.response, so the post_response observer that stores it (basic_session,
+    which fires AFTER us in cross-cascade order) persists the tidied text. Touches
+    every reasoning key present (reasoning / reasoning_content) on BOTH the flat
+    ctx.response and the nested _full_response.choices[0].message (basic_session
+    reads the latter). No-op unless tidy_reasoning_whitespace is enabled."""
+    if not _enabled(config, "tidy_reasoning_whitespace"):
+        return
+    resp = ctx.response
+    if not isinstance(resp, dict):
+        return
+
+    targets: list[dict] = [resp]
+    full = resp.get("_full_response")
+    if isinstance(full, dict):
+        choices = full.get("choices")
+        if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+            msg = choices[0].get("message")
+            if isinstance(msg, dict):
+                targets.append(msg)
+
+    tidied = 0
+    for obj in targets:
+        for key in _REASONING_KEYS:  # reasoning_content, reasoning
+            val = obj.get(key)
+            if isinstance(val, str) and "\n" in val:
+                new = tidy_reasoning_text(val)
+                if new != val:
+                    obj[key] = new
+                    tidied += 1
+    if tidied:
+        logger.debug(
+            f"quirks_mode: tidied reasoning whitespace on "
+            f"{tidied} field(s) for '{_session_key(ctx)}'"
+        )
 
 
 def _assembled_turn(ctx: "PipelineCtx") -> dict | None:

@@ -21,7 +21,7 @@ Four stages, all config-gated, on one config block:
   2. BUILD_TOOL_LIST (stateless, EVERY turn, default OFF)
      Rebuild the live tool list from ``ctx.request.tools`` every turn and append
      it to the system prompt. Because the source of truth is *always present*,
-     the buddy has no excuse to infer stale tools — this sidesteps detection.
+     the agent has no excuse to infer stale tools — this sidesteps detection.
 
      NOTE: this is the SONNET-family path. Sonnet treats the system prompt as
      readable text and can recite its tools. Models with strict thinking-mode
@@ -36,7 +36,7 @@ Four stages, all config-gated, on one config block:
 
   4. BRIDGE_CONTEXT_LIST (stateful, conditional, default OFF)
      Assemble the live tool list into ``ctx.bridge_context["tools"]`` — the
-     READABLE channel for Moonshot buddies — but ONLY on a trigger worth the
+     READABLE channel for Moonshot agents — but ONLY on a trigger worth the
      tokens: a new session, a harness/client change, or both (``bridge_context_on``,
      default ``both``). Because basic_session stores the WRAPPED user turn (with
      its bridge_context) into history, the list then persists in conversation
@@ -129,6 +129,18 @@ def modify_context(ctx: "PipelineCtx", config: dict) -> "PipelineCtx":
     if not nudge_on and not build_on and not bridge_list_on:
         return ctx  # plugin wired but no stage enabled — no-op
 
+    # bridge_messaging DELIVERY turn — skip entirely. On a delivery turn the
+    # recipient's send/list tools are withheld (loop-break), so the toolset
+    # legitimately differs from the agent's normal turns. Without this skip,
+    # tool_awareness fingerprints the (transiently-different) toolset, sees it
+    # "change" every delivery turn, and fires a perpetual "tools changed" nudge —
+    # noise this pattern can cause if unguarded. A delivery turn
+    # is a transient receive-and-reply, not a real harness switch: don't fingerprint
+    # it, don't nudge on it, and don't let it poison the stored fingerprint that the
+    # agent's NORMAL turns compare against.
+    if getattr(ctx.identity, "trust", None) == "bridge_messaging":
+        return ctx
+
     tools = ctx.request.tools or []
     if not tools:
         # Fail loud: a tool-reading stage is on but there are no tools. Most
@@ -180,7 +192,7 @@ def _maybe_nudge(ctx: "PipelineCtx", config: dict, changed: bool) -> None:
     if changed:
         nudge_text = config.get("nudge_text") or _DEFAULT_NUDGE_TEXT
         ctx.bridge_context["tools"] = nudge_text
-        logger.info("tool_awareness: tool set changed — nudging buddy")
+        logger.info("tool_awareness: tool set changed — nudging agent")
 
 
 # ---------------------------------------------------------------------------

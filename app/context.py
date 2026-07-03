@@ -221,6 +221,20 @@ class PipelineCtx:
     this rather than re-resolving from config, unless they have explicit
     plugin-level timezone config."""
 
+    max_tool_laps: int = 1
+    """Runaway guardrail for the bridge's agentic tool loop (the
+    ``handle_tool_calls`` intercept loop in pipeline_executor). The number of
+    re-call laps the bridge resolves bridge-native tools in-band before giving
+    up. It is NOT a feature leash — the never-leak guard already makes "the
+    model never stops" safe — it's purely a cost/latency runaway bound.
+
+    ``0`` means **uncapped**: the loop runs until the model stops calling tools
+    (``finish_reason != tool_calls``). Resolved at ctx-build time top-down from
+    the cascade (``identity → role → session → resource → server``), falling
+    back to the ``BRIDGE_HANDLE_TOOL_CALLS_MAX_LAPS`` env var, then to 1. A
+    bare scalar config key (``max_tool_laps:``), not a plugin — same shape as
+    ``timezone``."""
+
     headers: dict[str, str] = field(default_factory=dict)
     """Sanitised inbound headers, lowercased keys. Hop-by-hop headers
     stripped at intake."""

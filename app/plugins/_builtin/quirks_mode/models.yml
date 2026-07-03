@@ -1,7 +1,7 @@
 # quirks_mode/models.yml — known-good model → quirk recipes ("the cheat sheet")
 #
 # Maps a real model string to the list of provider-compat quirks that model is
-# known to need. A buddy on that model just sets `quirks_mode: {model: "<key>"}`
+# known to need. An agent on that model just sets `quirks_mode: {model: "<key>"}`
 # and inherits the proven recipe — no need to re-derive the quirks by hand.
 #
 # Adding a model: bring it up with a hand `quirks: [...]` list (the workbench),

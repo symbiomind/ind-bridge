@@ -92,6 +92,7 @@ def load_config() -> None:
             return
 
         _SERVER_CFG = server
+        _synthesize_internal_carriers(server)
         _TOKEN_MAP = _build_token_map(server)
         _config_loaded = True
 
@@ -213,6 +214,87 @@ def _expand_env_vars(obj):
     elif isinstance(obj, list):
         return [_expand_env_vars(i) for i in obj]
     return obj
+
+
+INTERNAL_CARRIER_PREFIX = "__bridge_internal__"
+"""Prefix for identities the bridge synthesises for roles that are reachable
+agent-to-agent (``bridge_messaging.agent_listing: true``) but have no operator-
+declared identity pointing at them. Dispatch (``execute``) is keyed by identity;
+a synthesised carrier gives such a role a token-less internal identity so its
+pipeline can be materialised. These are never externally callable (no token,
+no listener) — they exist purely as the in-process dispatch handle for the role."""
+
+
+def _synthesize_internal_carriers(server: dict) -> None:
+    """Inject a token-less internal identity for EVERY role listed for
+    agent-to-agent messaging (``agent_listing: true``).
+
+    THE TWO LANES (why this is unconditional). A message reaches a role two ways:
+      • CHAT lane — ``HTTP client → operator identity (the WHO) → role``. The
+        identity is load-bearing: it IS the caller (name/trust/overrides).
+      • bridge_messaging lane — ``sending agent → recipient ROLE directly, with a
+        CONSTRUCTED sovereign caller``. The caller is minted by the bridge; it must
+        NOT borrow a pre-existing chat identity (that identity's own
+        ``context.plugins`` — e.g. a ``conversational_memory: false`` tombstone —
+        would cascade over the role and silently alter the delivered pipeline).
+
+    Dispatch (``execute``) is keyed by identity, so the bridge_messaging lane still
+    needs a vehicle. That vehicle is this NEUTRAL role-only carrier —
+    ``__bridge_internal__<role>`` with ``{role: <role>}`` and nothing else — so a
+    delivery materialises the role's composition PURELY, inheriting no human
+    identity's overrides. The sovereign caller (name/trust/additional) is stamped
+    on top in ``_build_ctx`` (see ``_bridge_caller``), so the bare carrier needs no
+    ``context`` of its own.
+
+    Minted for every agent-listed role REGARDLESS of whether operator identities
+    also point at it — the chat lane and the delivery lane are independent, and the
+    carrier is the delivery lane's handle. (Previously withheld when a role had an
+    operator identity, which forced ``bridge_messaging`` to borrow the first such
+    identity as the carrier — an ordering-dependent leak of that identity's
+    ``context.plugins`` into deliveries.) Idempotent and non-destructive: an already
+    -present carrier key is left untouched. Mutates ``server["identities"]`` in place.
+    """
+    roles = server.get("roles", {}) or {}
+    identities = server.setdefault("identities", {}) or {}
+    server["identities"] = identities  # ensure the dict is attached even if it was None
+
+    for role_key, role_cfg in roles.items():
+        if not isinstance(role_cfg, dict):
+            continue
+        # bridge_messaging's idiomatic single-block home is context.plugins (the
+        # tool-inject slot, from which background/handle_tool_calls fan out). Read
+        # THAT first, falling back to the legacy top-level plugins block so older
+        # two-block configs still synthesise carriers. Mirrors the plugin's own
+        # _role_bridge_messaging_cfg resolution (kept in sync by hand — config.py
+        # must not import plugin code).
+        ctx_plugins = (role_cfg.get("context") or {}).get("plugins") or {}
+        bm = ctx_plugins.get("bridge_messaging")
+        if not isinstance(bm, dict):
+            bm = (role_cfg.get("plugins") or {}).get("bridge_messaging")
+        agent_listed = isinstance(bm, dict) and bm.get("agent_listing")
+
+        # A conversational_memory TASK worker (tasks: [label_enrichment, …]) is also
+        # reached in-process via execute() — the enrichment loop fires the worker's
+        # role through its carrier, exactly like a bridge_messaging delivery. So it
+        # needs the same neutral role-only dispatch handle, even though it declares
+        # no bridge_messaging block. Read tasks: the same context-first way.
+        cm = ctx_plugins.get("conversational_memory")
+        if not isinstance(cm, dict):
+            cm = (role_cfg.get("plugins") or {}).get("conversational_memory")
+        task_worker = isinstance(cm, dict) and bool(cm.get("tasks"))
+
+        if not (agent_listed or task_worker):
+            continue
+        carrier_key = f"{INTERNAL_CARRIER_PREFIX}{role_key}"
+        if carrier_key in identities:
+            continue
+        identities[carrier_key] = {"role": role_key}
+        reason = "agent-listed" if agent_listed else "task-worker"
+        logger.info(
+            f"Synthesised internal carrier identity '{carrier_key}' for "
+            f"{reason} role '{role_key}' (neutral in-process dispatch vehicle — "
+            f"execute() never borrows a chat identity)."
+        )
 
 
 def _build_token_map(server: dict) -> dict[str, str]:

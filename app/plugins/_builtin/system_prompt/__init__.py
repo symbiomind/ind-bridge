@@ -145,20 +145,15 @@ def _load_items(items: list) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Message helpers
+# Message helpers — delegate to the shared app.system_message helper so the
+# "exactly one system message" invariant is single-sourced (skills reuses it).
 # ---------------------------------------------------------------------------
 
 def _extract_system(messages: list[dict]) -> str | None:
-    for msg in messages:
-        if msg.get("role") == "system":
-            content = msg.get("content", "")
-            return str(content).strip() or None
-    return None
+    from app import system_message
+    return system_message.extract_system(messages)
 
 
 def _set_system(messages: list[dict], content: str) -> None:
-    for i, msg in enumerate(messages):
-        if msg.get("role") == "system":
-            messages[i] = {**msg, "content": content}
-            return
-    messages.insert(0, {"role": "system", "content": content})
+    from app import system_message
+    system_message.set_system(messages, content)

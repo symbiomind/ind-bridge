@@ -105,6 +105,23 @@ async def lifespan(app: FastAPI):
         # Give them a moment to unwind; swallow the expected CancelledError.
         await asyncio.gather(*_background_tasks, return_exceptions=True)
         _background_tasks.clear()
+
+    # Symmetric plugin teardown: any loaded plugin exposing an async
+    # `shutdown()` gets called (e.g. mcp_client closing its persistent
+    # gateway sessions so the gateway's `--rm` containers don't leak). A
+    # plugin that raises is logged and skipped — shutdown is best-effort.
+    for plugin_name, plugin in plugin_loader.get_registry().items():
+        shutdown_fn = getattr(plugin, "shutdown", None)
+        if shutdown_fn is None or not asyncio.iscoroutinefunction(shutdown_fn):
+            continue
+        try:
+            await shutdown_fn()
+        except Exception as e:
+            logger.warning(
+                f"Plugin '{plugin_name}' shutdown() raised "
+                f"{type(e).__name__}: {e} — skipping."
+            )
+
     logger.info("ind-bridge shutting down.")
 
 
@@ -201,9 +218,15 @@ def _spawn_background_tasks(app: FastAPI) -> int:
 
     The generic cousin of ``_materialise_listeners``: ``listener`` registers an
     HTTP route, ``background`` spawns a long-running task that runs outside the
-    request cycle (a polling daemon, a cron-like ticker). Per the capability
-    contract, ``background`` is only valid on ``identity.plugins`` — per-identity,
-    like listeners. The V3 ``server.startup`` hook's V4-shaped replacement.
+    request cycle (a polling daemon, a cron-like ticker). The V3
+    ``server.startup`` hook's V4-shaped replacement.
+
+    ``background`` is per-identity (one spawn per identity that wires the plugin),
+    but the wiring may sit on ANY cascade slot the plugin declares the capability
+    for — ``identity.plugins`` (cron), or ``session.plugins`` (basic_session's
+    daily reset-archive scheduler). The union below discovers the plugin on
+    whichever slot it occupies; the gate then confirms the plugin actually
+    declares ``background`` (on any valid slot) before spawning.
 
     Returns the count of successful spawns. A plugin whose ``start_background``
     raises or returns no coroutine is logged and skipped — the bridge continues.
@@ -217,19 +240,46 @@ def _spawn_background_tasks(app: FastAPI) -> int:
         # A background plugin may be declared on the identity OR inherited from
         # the role (capability fan-out: declare a plugin's server map once on
         # the role, every identity on that role spawns its discovery — no
-        # per-identity `mcp_client: {}` marker needed). Union the cascade's
-        # `plugins` family keyed by NAME so a plugin declared at BOTH levels
-        # (back-compat configs) spawns exactly ONCE per identity, not twice.
+        # per-identity `mcp_client: {}` marker needed). Union the cascade
+        # keyed by NAME so a plugin declared at multiple levels (back-compat
+        # configs) spawns exactly ONCE per identity, not twice.
+        #
+        # We discover across BOTH the top-level `plugins` family AND the
+        # `context.plugins` family. A background-capable plugin whose idiomatic
+        # single-block home is `context.plugins` (bridge_messaging: one block
+        # from which context_modify + background + handle_tool_calls fan out)
+        # would otherwise be invisible here — spawned only if it ALSO had a
+        # top-level declaration. `plugin_slot_family` remembers where each name
+        # was found so the config merge below reads the RIGHT slot family
+        # (top-level `plugins` wins if a plugin appears in both — that's the
+        # conventional home for background config, and merge_plugin_configs
+        # re-walks the whole cascade for that family in priority order).
         cascade = cascade_mod.resolve_cascade(identity_key)
-        plugin_names: set[str] = set()
-        if isinstance(identity_cfg.get("plugins"), dict):
-            plugin_names |= set(identity_cfg["plugins"].keys())
-        if cascade and cascade.role_cfg and isinstance(cascade.role_cfg.get("plugins"), dict):
-            plugin_names |= set(cascade.role_cfg["plugins"].keys())
-        if cascade and cascade.session_cfg and isinstance(cascade.session_cfg.get("plugins"), dict):
-            plugin_names |= set(cascade.session_cfg["plugins"].keys())
-        if cascade and cascade.resource_cfg and isinstance(cascade.resource_cfg.get("plugins"), dict):
-            plugin_names |= set(cascade.resource_cfg["plugins"].keys())
+        plugin_slot_family: dict[str, str] = {}
+
+        def _collect(block: dict | None):
+            if not isinstance(block, dict):
+                return
+            # context.plugins first, then top-level plugins so that a name in
+            # BOTH resolves to "plugins" (last write wins for the merge family).
+            ctx_plugins = (block.get("context") or {}).get("plugins")
+            if isinstance(ctx_plugins, dict):
+                for n in ctx_plugins:
+                    plugin_slot_family.setdefault(n, "context.plugins")
+            top_plugins = block.get("plugins")
+            if isinstance(top_plugins, dict):
+                for n in top_plugins:
+                    plugin_slot_family[n] = "plugins"
+
+        _collect(identity_cfg)
+        if cascade:
+            _collect(cascade.role_cfg)
+            # sessions/resources have no context block (D-006) — top-level only.
+            for blk in (cascade.session_cfg, cascade.resource_cfg):
+                if isinstance(blk, dict) and isinstance(blk.get("plugins"), dict):
+                    for n in blk["plugins"]:
+                        plugin_slot_family[n] = "plugins"
+        plugin_names = set(plugin_slot_family)
         if not plugin_names:
             continue
 
@@ -239,7 +289,11 @@ def _spawn_background_tasks(app: FastAPI) -> int:
                 continue
 
             caps = plugin_loader.get_capabilities(plugin_name) or {}
-            if "identity.plugins" not in (caps.get("background") or []):
+            # Spawn if the plugin declares `background` on ANY valid slot — it was
+            # already discovered on a real cascade slot by the union above, so its
+            # presence here means it's wired for this identity (cron on
+            # identity.plugins, basic_session on session.plugins, …).
+            if not (caps.get("background") or []):
                 continue
 
             start_fn = getattr(plugin, "start_background", None)
@@ -255,8 +309,13 @@ def _spawn_background_tasks(app: FastAPI) -> int:
             # config sees correct identity>role override behaviour. (mcp_client
             # ignores it — start_background/_find_server_map resolve the role
             # map themselves — but principle-of-least-surprise for the next one.)
+            # Merge from the slot FAMILY the plugin was discovered in, so a
+            # context.plugins-only plugin (bridge_messaging) gets its real config
+            # rather than an empty top-level merge. Priority cascade is preserved:
+            # merge_plugin_configs re-walks all cascade levels for that family.
+            slot_family = plugin_slot_family.get(plugin_name, "plugins")
             plugin_config = (
-                cascade_mod.merge_plugin_configs(cascade, plugin_name, "plugins")
+                cascade_mod.merge_plugin_configs(cascade, plugin_name, slot_family)
                 if cascade else {}
             )
 
@@ -296,7 +355,55 @@ def _spawn_background_tasks(app: FastAPI) -> int:
                     exc_info=True,
                 )
 
+    # SERVER-SCOPED background spawns. Some background daemons aren't tied to a
+    # single identity — they read a top-level `server.plugins.<name>` registry and
+    # spawn once for the whole bridge. conversational_memory's label-enrichment loop
+    # is the first: it spawns one catch-up loop per registered memory store, driven
+    # by `server.plugins.conversational_memory`. We invoke such a plugin's
+    # start_background ONCE with the `__server__` sentinel identity_key; the plugin
+    # returns None for its per-identity discovery calls (above) and only spawns here.
+    from app.plugins._builtin.conversational_memory import _SERVER_SCOPE as _CM_SERVER_SCOPE
+    spawn_count += _spawn_server_scoped_background(app, server_cfg, "conversational_memory", _CM_SERVER_SCOPE)
+
     return spawn_count
+
+
+def _spawn_server_scoped_background(
+    app: FastAPI, server_cfg: dict, plugin_name: str, scope_key: str
+) -> int:
+    """Invoke a plugin's start_background ONCE at server scope (not per-identity).
+
+    For daemons that read a top-level ``server.plugins.<name>`` registry and spawn
+    for the whole bridge. Passes the ``scope_key`` sentinel as identity_key + an
+    empty identity_cfg. Errors are logged and swallowed — the bridge continues.
+    Returns 1 on a successful spawn, else 0."""
+    plugin = plugin_loader.get_plugin(plugin_name)
+    if plugin is None:
+        return 0
+    start_fn = getattr(plugin, "start_background", None)
+    if start_fn is None:
+        return 0
+    startup_ctx = StartupCtx(
+        app=app,
+        server_cfg=server_cfg,
+        identity_key=scope_key,
+        identity_cfg={},
+    )
+    try:
+        coro = start_fn(startup_ctx, {})
+        if coro is None:
+            return 0  # nothing configured (DLC-grace).
+        task = asyncio.ensure_future(coro)
+        _background_tasks.append(task)
+        logger.info(f"Background task spawned: scope='{scope_key}' plugin='{plugin_name}'")
+        return 1
+    except Exception as e:
+        logger.error(
+            f"Server-scoped background spawn failed for plugin '{plugin_name}': "
+            f"{e!r} — task skipped, bridge continues.",
+            exc_info=True,
+        )
+        return 0
 
 
 # ---------------------------------------------------------------------------
