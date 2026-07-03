@@ -306,11 +306,18 @@ def modify_context(ctx: "PipelineCtx", config: dict) -> "PipelineCtx":
     # recipient "replies" by calling send back, which spawns a NEW delivery instead of
     # returning text up the caller's output:true stack; the caller's wait times out,
     # the late reply arrives as fresh mail, and that restarts the dance → A→B→A→B
-    # runaway. With the tool withheld, the recipient replies with
+    # runaway. With the SEND/LIST tools withheld, the recipient replies with
     # TEXT, which output:true returns to the original caller — one clean hop. The
     # caller (agent or human) then DECIDES whether to send again; the round-trip is
     # never an automatic bounce. A recipient running normally (not via bridge_messaging)
     # keeps full tools.
+    #
+    # NOTE: this withholds ONLY the send/list tools. The recipient KEEPS their own
+    # tools (mcp_client memory queries, file reads, etc.) — a delivery turn runs the
+    # recipient's normal intercept tool loop so they can DO WORK to assemble a reply
+    # (e.g. a librarian messaged "find X" queries the memory, then answers in prose).
+    # That's the whole point of delegating to a specialist. The loop-break is the
+    # send-tool withhold ALONE; it is sufficient (no send tool → no recursive re-send).
     if getattr(ctx.identity, "trust", None) == _BRIDGE_TRUST:
         logger.info(
             f"bridge_messaging: identity '{ctx.identity.key}' is a bridge_messaging "
@@ -496,14 +503,19 @@ async def _handle_send(ctx: "PipelineCtx", args: dict, config: dict) -> str:
     # (method + tool attribution), immutable under the signature. That's sufficient —
     # the recipient reasons about the caller from context, not from injected prose.
     #
-    # The clean-reply behaviour that the old contract-footer nominally drove is carried
-    # STRUCTURALLY, not by instruction: _bridge_no_tools means a delivery turn has no
-    # tools, so the recipient answers in words (it can't run docker / re-send), and
-    # _strip_trailing_tool_junk cleans any model that still bleeds tool markup. output
-    # governs whether that reply is returned to the caller; a reply to an output:false
-    # message is just the recipient commentating in its own space (store true/false
-    # decides whether it persists). Future knobs (an optional configurable directive as
-    # a <bridge_context> element) can be added later — none is needed now.
+    # THE RECIPIENT ANSWERS WITH THEIR OWN HANDS. A delivery turn keeps the recipient's
+    # OWN tools (memory query, file reads, etc.) so they can DO WORK to assemble a reply
+    # — e.g. a librarian messaged "find X" runs retrieve_memories, digs deeper, then
+    # returns prose. This is what makes agent→agent messaging a real delegation, not a
+    # blind single-shot reply. The loop-break that prevents an A→B→A→B bounce is carried
+    # by modify_context WITHHOLDING ONLY THE SEND/LIST TOOLS on a delivery turn (trust ==
+    # bridge_messaging): with no send tool the recipient CANNOT recursively re-send, so
+    # they reply with TEXT (their reply returns up the output:true stack; the CALLER then
+    # decides whether to follow up). Their own tool loop is bounded by max_tool_laps (the
+    # runaway guardrail). _strip_trailing_tool_junk still cleans any trailing tool markup.
+    # output governs whether the reply is returned; store true/false decides persistence.
+    # (We do NOT set _bridge_no_tools here — that blanket strip is for the label-
+    #  enrichment worker, which genuinely wants zero tools; a delivery is not that.)
     framed = message
 
     # Build the delivery body. The reserved _bridge_* keys are popped in _build_ctx
@@ -511,22 +523,15 @@ async def _handle_send(ctx: "PipelineCtx", args: dict, config: dict) -> str:
     body: dict = {
         "messages": [{"role": "user", "content": framed}],
         # Force non-stream so execute() returns a plain response DICT (with the
-        # recipient's text), not a FastAPI StreamingResponse. Without this, an
-        # observers-only recipient turn (conv_mem post_response) takes the streaming
-        # pass-through path and _extract_reply_text gets a StreamingResponse it can't
-        # read → the recipient's real reply (stored fine) reads back as "no reply".
-        # We are an in-process caller; we want the text, not a stream.
+        # recipient's text), not a FastAPI StreamingResponse. The non-stream path also
+        # runs the recipient's intercept tool loop (_dispatch_intercepts: claim →
+        # execute → splice → re-call) so a delivery turn that USES tools resolves them
+        # and returns the assembled prose. Without stream:False an observers-only turn
+        # takes the streaming pass-through and _extract_reply_text gets a
+        # StreamingResponse it can't read → reads back as "no reply".
         "stream": False,
         "_bridge_caller": sovereign_caller,
         "_bridge_trust": _BRIDGE_TRUST,
-        # LOOP-BREAK + reply-as-text: a delivery turn gets NO tools at all. The
-        # recipient REPLIES (words), it doesn't go run docker / store memories /
-        # recursively re-send. Cleared at the resource-call gate in _build_ctx so it
-        # survives whatever any context plugin (mcp_client's discovered tools, etc.)
-        # injects — ordering-proof. The recipient's reply returns as text up the
-        # output:true stack; the CALLER then decides whether to follow up (a normal,
-        # fully-tooled turn).
-        "_bridge_no_tools": True,
     }
     # `storage` is a TURN-handling marker, not a caller-identity attribute — so it
     # rides on the <bridge_context> ENVELOPE (via _bridge_storage → _build_ctx →
@@ -613,13 +618,14 @@ def _extract_reply_text(resp) -> str | None:
     {role, content, _full_response} for non-stream; we want `content`. A
     StreamingResponse (no .get) or empty content → None.
 
-    Robustness: a delivery turn gets NO tools (see modify_context / _bridge_no_tools),
-    but some models (minimax-m3) STILL emit a tool-call-shaped blob trailing their
-    prose reply — either the `]<]minimax[>[<tool_call>…` wire markup or a bare
-    `[{"name": …, "arguments": …}]` JSON array. With no tools wired, that blob is INERT
-    text the recipient appended after actually replying in words. We return the PROSE
-    and strip the trailing inert tool-call junk so the caller gets the real reply, not
-    a muddy words+JSON mix (which read as "no reply")."""
+    Robustness: a delivery turn withholds only the SEND/LIST tools (see modify_context);
+    the recipient's own tools resolve through the intercept loop, so `content` is their
+    assembled prose reply. But some models (minimax-m3) STILL emit a tool-call-shaped
+    blob trailing their prose — either the `]<]minimax[>[<tool_call>…` wire markup or a
+    bare `[{"name": …, "arguments": …}]` JSON array (a stray, unresolved echo). That blob
+    is INERT text the recipient appended after actually replying in words. We return the
+    PROSE and strip the trailing inert tool-call junk so the caller gets the real reply,
+    not a muddy words+JSON mix (which read as "no reply")."""
     if not isinstance(resp, dict):
         return None
     # execute() hands back one of two dict shapes depending on path:
