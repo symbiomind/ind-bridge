@@ -73,8 +73,11 @@ Contract:
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 import logging
+import re
 import time
 import uuid
 from typing import Any, AsyncIterator
@@ -95,12 +98,22 @@ _DONE_LINE = b"data: [DONE]\n\n"
 # Public API
 # ---------------------------------------------------------------------------
 
-async def emit_frame_as_sse(frame: dict) -> AsyncIterator[bytes]:
+async def emit_frame_as_sse(
+    frame: dict, pacing: dict | None = None,
+) -> AsyncIterator[bytes]:
     """Yield SSE-event bytes representing the assembled assistant turn.
 
     Tolerant of either input shape (see module docstring). Async
     generator so it plugs into FastAPI's ``StreamingResponse(...)``
     directly without an intermediate buffer.
+
+    ``pacing`` (optional) turns the single content delta into word-by-word
+    deltas with a natural typing cadence: ``{"min_tps": 5, "max_tps": 10}``
+    drifts deterministically between the two rates (tokens/second). A
+    terminal resource plugin requests this by setting
+    ``ctx.response["_stream_pacing"]``; the executor pops the marker and
+    passes it here. Reasoning/tool_call deltas are never paced — cadence
+    is a content affordance, not a transport property.
 
     Defensive: a missing/malformed input field becomes an empty/None
     delta, never an exception. The point of this module is to *always*
@@ -152,11 +165,17 @@ async def emit_frame_as_sse(frame: dict) -> AsyncIterator[bytes]:
 
     content = msg.get("content")
     if isinstance(content, str) and content:
-        yield _format_chunk(
-            base_envelope,
-            delta={"content": content},
-            finish_reason=None,
-        )
+        if pacing:
+            async for chunk in _paced_content_chunks(
+                base_envelope, content, pacing,
+            ):
+                yield chunk
+        else:
+            yield _format_chunk(
+                base_envelope,
+                delta={"content": content},
+                finish_reason=None,
+            )
 
     tool_calls = msg.get("tool_calls")
     if isinstance(tool_calls, list) and tool_calls:
@@ -168,6 +187,59 @@ async def emit_frame_as_sse(frame: dict) -> AsyncIterator[bytes]:
 
     yield _format_chunk(base_envelope, delta={}, finish_reason=finish_reason)
     yield _DONE_LINE
+
+
+# ---------------------------------------------------------------------------
+# Paced emission — word-by-word deltas with a deterministic cadence drift
+# ---------------------------------------------------------------------------
+
+_PACED_TOKEN_RE = re.compile(r"\S+\s*")
+_DEFAULT_MIN_TPS = 5.0
+_DEFAULT_MAX_TPS = 10.0
+
+
+def _pace_intervals(content: str, pacing: dict) -> list[float]:
+    """Per-token sleep intervals. The rate drifts between ``min_tps`` and
+    ``max_tps`` driven by a hash of (content, position) — deterministic
+    across runs (``hashlib``, not the salted builtin ``hash``), so the same
+    reply always types at the same rhythm."""
+    try:
+        min_tps = float(pacing.get("min_tps", _DEFAULT_MIN_TPS))
+        max_tps = float(pacing.get("max_tps", _DEFAULT_MAX_TPS))
+    except (TypeError, ValueError):
+        min_tps, max_tps = _DEFAULT_MIN_TPS, _DEFAULT_MAX_TPS
+    min_tps = max(0.5, min_tps)
+    max_tps = max(min_tps, max_tps)
+
+    seed = hashlib.md5(content.encode("utf-8")).digest()
+    intervals = []
+    tokens = _PACED_TOKEN_RE.findall(content)
+    for i in range(len(tokens)):
+        frac = hashlib.md5(seed + i.to_bytes(4, "big")).digest()[0] / 255.0
+        tps = min_tps + (max_tps - min_tps) * frac
+        intervals.append(1.0 / tps)
+    return intervals
+
+
+async def _paced_content_chunks(
+    base_envelope: dict, content: str, pacing: dict,
+) -> AsyncIterator[bytes]:
+    """Emit the content one whitespace-delimited token per delta, sleeping
+    between tokens. The first token goes out immediately; concatenating all
+    deltas reproduces the content byte-for-byte."""
+    tokens = _PACED_TOKEN_RE.findall(content)
+    if not tokens:
+        yield _format_chunk(
+            base_envelope, delta={"content": content}, finish_reason=None,
+        )
+        return
+    intervals = _pace_intervals(content, pacing)
+    for i, token in enumerate(tokens):
+        if i:
+            await asyncio.sleep(intervals[i])
+        yield _format_chunk(
+            base_envelope, delta={"content": token}, finish_reason=None,
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -84,14 +84,24 @@ _RESPONSE_SLOTS = frozenset({
 })
 
 
-def _is_post_response_tuple(plugin: Any) -> bool:
-    """True iff this plugin declares the `post_response` capability.
+def _is_post_response_tuple(slot: str, plugin: Any) -> bool:
+    """True iff this tuple contributes the plugin's `post_response` capability.
 
     Per D-007: post_response plugins live at `identity.plugins` or
     `role.plugins` — the same slots `outbound_params` uses, so slot-string
-    matching alone isn't enough. We have to ask the capability table."""
+    matching alone isn't enough. We have to ask the capability table.
+
+    We check BOTH the declared capability AND that *this tuple's slot* is a
+    valid post_response slot. A multi-capability plugin can fan out across
+    slots that belong to DIFFERENT capabilities — e.g. conversational_memory
+    declares `post_response` at its `*.context.plugins` slots but `background`
+    at `identity.plugins`. The fan-out emits an (empty-config) `identity.plugins`
+    tuple for `background`; without the slot check it would masquerade as a
+    post_response tuple, and _dedupe_by_plugin (first-by-slot-order wins) would
+    keep the empty one and drop the real context-slot config — silently killing
+    auto-store. The slot check filters the wrong-capability tuple out first."""
     caps = plugin_loader.get_capabilities(_short_name(plugin)) or {}
-    return "post_response" in caps
+    return slot in (caps.get("post_response") or [])
 
 
 def _has_response_modify(pipeline: list) -> bool:
@@ -280,10 +290,15 @@ async def execute(
         # pause), and stitch to one [DONE]. Kills the long-loop client timeout
         # (→ the cancellation turn-loss gap) and makes invisible bridge tools
         # legible. Opt-in via BRIDGE_STREAM_INTERCEPTS=1 during dogfooding.
+        # Terminal resources (produce_response) are excluded: there is no
+        # upstream stream to forward, so the intercept loop has nothing to
+        # keep alive — and _build_outbound_request has no URL to build. The
+        # buffered branch below handles terminal + intercepts + SSE re-emit.
         if (
             ctx.request.stream
             and pipeline_assembler.has_intercepts(pipeline)
             and not _has_response_modify(pipeline)
+            and not pipeline_assembler.has_terminal_resource(identity_key)
             and os.getenv("BRIDGE_STREAM_INTERCEPTS") == "1"
         ):
             logger.info(
@@ -364,6 +379,15 @@ async def execute(
             return resource_result
         ctx = resource_result  # ctx was returned (non-stream/terminal)
 
+        # A terminal resource plugin may request paced (word-by-word) SSE
+        # re-emission via the `_stream_pacing` response marker. Pop it here
+        # so observers, session storage, and the client envelope never see
+        # the transport hint — only the step-10 re-emit consumes it.
+        stream_pacing = (
+            ctx.response.pop("_stream_pacing", None)
+            if isinstance(ctx.response, dict) else None
+        )
+
         # 7. handle_tool_calls intercept dispatch (D-008). Stub for now —
         #    fills in once the capability machinery lands. Reached only on
         #    the buffered (non-streaming-upstream) path because intercepts
@@ -406,16 +430,21 @@ async def execute(
 
         result = _ctx_response_to_openai(ctx)
 
-        # 10. SSE re-emit when client wanted streaming AND we forced
-        #     non-streaming upstream (pre-delivery plugins were wired). The
-        #     client never sees that the upstream was non-stream — we hand
-        #     them an SSE stream of the assembled (and possibly modified
-        #     and/or intercepted) frame. Honours the V3 invisibility
-        #     property: pre-delivery is operationally invisible to the
-        #     client.
-        if pre_delivery_wired and client_requested_stream:
+        # 10. SSE re-emit when the client wanted streaming but we hold a
+        #     buffered frame. Reaching this point with client_requested_stream
+        #     implies the frame was assembled locally — either pre-delivery
+        #     plugins forced the upstream non-streaming, or the resource was
+        #     terminal (produce_response never streams). True pass-through
+        #     streaming already returned at step 6. Either way the client
+        #     never sees the difference — we hand them an SSE stream of the
+        #     assembled (and possibly modified and/or intercepted) frame.
+        #     Honours the V3 invisibility property: buffering is
+        #     operationally invisible to the client.
+        if client_requested_stream:
             ctx.slots_visited.append(
                 "[core] SSE re-emit — buffered upstream → streamed client"
+                if pre_delivery_wired
+                else "[core] SSE re-emit — terminal frame → streamed client"
             )
             dev_trace.end_request(
                 ctx.dev_trace, status="ok-restreamed",
@@ -425,7 +454,7 @@ async def execute(
                 ),
             )
             return StreamingResponse(
-                frame_emit.emit_frame_as_sse(result),
+                frame_emit.emit_frame_as_sse(result, pacing=stream_pacing),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
@@ -1120,7 +1149,7 @@ def _collect_observer_tuples(pipeline: list) -> list[tuple[str, Any, dict]]:
     return _dedupe_by_plugin(
         (slot, plugin, cfg)
         for slot, plugin, cfg in pipeline
-        if _is_post_response_tuple(plugin)
+        if _is_post_response_tuple(slot, plugin)
     )
 
 
@@ -1139,7 +1168,12 @@ def _collect_outbound_normalize_tuples(pipeline: list) -> list[tuple[str, Any, d
     out = []
     for slot, plugin, plugin_config in pipeline:
         caps = plugin_loader.get_capabilities(_short_name(plugin)) or {}
-        if "outbound_normalize" in caps:
+        # Slot-aware: only tuples placed at an `outbound_normalize` slot count.
+        # A fan-out plugin whose OTHER capability lives at a different slot
+        # (with empty config) must not masquerade as a normalize tuple and win
+        # _dedupe_by_plugin — same failure mode as conv_mem's `background` slot
+        # shadowing its post_response config. See _is_post_response_tuple.
+        if slot in (caps.get("outbound_normalize") or []):
             out.append((slot, plugin, plugin_config))
     return _dedupe_by_plugin(out)
 
@@ -1504,14 +1538,21 @@ def _collect_intercept_tuples(pipeline: list) -> list[tuple[str, Any, dict]]:
     return _dedupe_by_plugin(
         (slot, plugin, plugin_config)
         for slot, plugin, plugin_config in pipeline
-        if _is_intercept_tuple(plugin)
+        if _is_intercept_tuple(slot, plugin)
     )
 
 
-def _is_intercept_tuple(plugin: Any) -> bool:
-    """True iff this plugin declares the `handle_tool_calls` capability."""
+def _is_intercept_tuple(slot: str, plugin: Any) -> bool:
+    """True iff this tuple contributes the plugin's `handle_tool_calls`
+    capability — declared AND placed at one of that capability's valid slots.
+
+    The slot check matters for the same reason as _is_post_response_tuple: a
+    multi-capability plugin (e.g. mcp_client: handle_tool_calls at role.plugins,
+    `background` at identity.plugins) fans out a tuple per slot, and the
+    background tuple carries empty config. Without the slot filter that empty
+    tuple could survive _dedupe_by_plugin and be dispatched with {}."""
     caps = plugin_loader.get_capabilities(_short_name(plugin)) or {}
-    return "handle_tool_calls" in caps
+    return slot in (caps.get("handle_tool_calls") or [])
 
 
 def _plugin_owned_tools(plugin: Any) -> list[str]:

@@ -147,8 +147,11 @@ def _load_plugin(name: str, plugin_dir: str, init_path: str, source: str) -> Non
             )
 
     try:
+        # submodule_search_locations makes the plugin a real package, so a
+        # plugin directory may split across files (`from . import helper`).
         spec = importlib.util.spec_from_file_location(
-            f"plugins.{source}.{name}", init_path
+            f"plugins.{source}.{name}", init_path,
+            submodule_search_locations=[plugin_dir],
         )
         module = importlib.util.module_from_spec(spec)
         sys.modules[f"plugins.{source}.{name}"] = module
