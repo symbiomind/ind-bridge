@@ -56,6 +56,16 @@ This plugin lives WHOLLY in one ``sessions.<name>.plugins`` block (D-010 lets
             degrade_tool_history: false      # opt-in: fold OLD tool exchanges to
                                              # assistant prose on SEND (storage stays full).
                                              # Keeps the most-recent closed exchange raw.
+            partitions:                      # optional: split ONE session block into
+                                             # several files keyed by CALLER (the signed
+                                             # <caller> = context.name). Unset = one
+                                             # shared file (default, unchanged).
+              team_a:                        #   named group → <base>__group__team_a.json
+                - alice
+                - bob
+              default: shared                # shared (one file) | caller (per-caller:
+                                             #   <base>__user__<caller>.json). A caller with
+                                             #   no context.name can only land in shared.
 
     roles:
       my_agent:
@@ -141,7 +151,7 @@ def apply_outbound_params(ctx: "PipelineCtx", config: dict) -> "PipelineCtx":
     """Load the session, rebuild the outbound message list, and stamp the
     authoritative ``session_state`` so the wakeup cascade fires on ground
     truth. Fires at executor step 1c (before context plugins)."""
-    session_key = _resolve_session_key(ctx)
+    session_key = _resolve_session_key(ctx, config)
     session_file = _session_file(session_key, config)
 
     history = _load_history(session_file)
@@ -431,7 +441,7 @@ async def _run_reset_loop(
         )
         try:
             await asyncio.sleep(delay)
-            _archive_session_file(session_key, session_file, tz)
+            _archive_session_family(session_key, session_file, tz)
         except asyncio.CancelledError:
             logger.info(
                 f"basic_session: reset loop for '{session_key}' cancelled — shutting down"
@@ -443,6 +453,45 @@ async def _run_reset_loop(
                 f"tick error — {e!r} — loop continues.",
                 exc_info=True,
             )
+
+
+def _archive_session_family(session_key: str, session_file: str, tz) -> None:
+    """Archive the base session file AND any partition siblings.
+
+    basic_session stays basic: rather than teach the reset loop about the
+    ``partitions`` config, we archive the sessions we FIND. Partition files live
+    in their own subfolders (``_session_file`` nests ``<data_dir>/<key>/<key>.json``
+    and partition keys are ``<base>__group__X`` / ``<base>__user__Y``), so we glob
+    sibling folders whose name starts with the base key and archive each one's
+    live ``.json``. Handles caller-mode's unpredictable per-caller names for free,
+    and stays correct if a config is later removed — we act on the filesystem, not
+    the config. No partitions configured → the glob finds exactly the base folder.
+
+    ``session_file`` is ``<data_dir>/<key>/<key>.json``; its grandparent is
+    ``data_dir``, and its parent-folder basename is the (sanitised) key."""
+    session_dir = os.path.dirname(session_file)        # <data_dir>/<key>
+    data_dir = os.path.dirname(session_dir)            # <data_dir>
+    base_folder = os.path.basename(session_dir)        # <key> (== session_key)
+
+    # Sibling folders: the base key itself + any "<base>__..." partition folders.
+    archived_any = False
+    try:
+        entries = sorted(os.listdir(data_dir)) if os.path.isdir(data_dir) else []
+    except OSError:
+        entries = []
+    for name in entries:
+        if name != base_folder and not name.startswith(f"{base_folder}__"):
+            continue
+        live = os.path.join(data_dir, name, f"{name}.json")
+        if os.path.exists(live):
+            _archive_session_file(name, live, tz)
+            archived_any = True
+
+    if not archived_any:
+        logger.info(
+            f"basic_session: reset for '{session_key}' — no session files to "
+            f"archive (already fresh / nothing spoken yet); skipping."
+        )
 
 
 def _archive_session_file(session_key: str, session_file: str, tz) -> None:
@@ -558,27 +607,103 @@ def _build_system_prompt(upstream_system: str | None, config: dict) -> str | Non
 # Session key + file helpers
 # ---------------------------------------------------------------------------
 
-def _resolve_session_key(ctx: "PipelineCtx") -> str:
-    """The session key IS the named session block (``role.session: <name>``).
+def _resolve_session_key(ctx: "PipelineCtx", config: dict) -> str:
+    """The session key IS the named session block (``role.session: <name>``),
+    optionally narrowed by a ``partitions`` map.
 
     A session is a top-level named block in V4, shared by name-and-reference —
     multiple identities can point at one role/session and MUST share its history
-    (D-006 / CLAUDE.md). So the key is the session's own name, not the caller's:
-    two identities on one role (e.g. ``*_librechat`` + ``*_openclaw``) resolve to
-    the SAME file → cross-harness conversation continuity.
+    (D-006 / CLAUDE.md). So the base key is the session's own name, not the
+    caller's: two identities on one role (e.g. ``*_librechat`` + ``*_openclaw``)
+    resolve to the SAME file → cross-harness conversation continuity.
 
     ``basic_session`` only loads from a ``sessions.<name>`` block (its CAPABILITIES
     restrict it to ``session.plugins``), so ``ctx.role.session_key`` is always set
     when this runs — a session that isn't defined doesn't exist, and this code
     wouldn't be running. A missing key means broken state, so we raise rather than
-    silently writing to a surprise file."""
+    silently writing to a surprise file.
+
+    **Partitions** (optional) split one session block into several files keyed by
+    CALLER — the signed ``<caller>`` name (``ctx.identity.name``, the value that
+    lands in the tamper-proof ``<caller>`` tag). With no ``partitions`` key the
+    base key is returned unchanged (zero behaviour change — the bridge does nothing
+    until configured). See ``_partition_suffix`` for the match rules."""
     if not ctx.role.session_key:
         raise RuntimeError(
             "basic_session: no session name on ctx.role.session_key — basic_session "
             "must be wired inside a sessions.<name> block. This should be unreachable "
             f"(identity={ctx.identity.key!r}, role={ctx.role.key!r})."
         )
-    return _sanitise_key(ctx.role.session_key)
+    base = _sanitise_key(ctx.role.session_key)
+    suffix = _partition_suffix(ctx.identity.name, config)
+    return f"{base}{suffix}" if suffix else base
+
+
+def _partition_suffix(caller: str | None, config: dict) -> str:
+    """Resolve the file-name suffix for a caller under a session's ``partitions``
+    map. Returns ``""`` (the shared base file) when partitions are unset or the
+    caller falls through to ``shared``.
+
+    Config shape::
+
+        partitions:
+          team_a:               # named group → suffix "__group__team_a"
+            - alice
+            - bob
+          default: shared       # shared (one file) | caller (per-caller isolation)
+
+    Match rules:
+      - Named group whose member list contains the caller (case-insensitive).
+        First match wins by config declaration order.
+      - No named match + ``default: caller`` → suffix "__user__<caller>".
+      - No named match + ``default: shared`` (or unset) → "" (base file).
+      - No caller name at all (no ``context.name``) → cannot match a group →
+        falls to ``default``. Partitions make ``context.name`` load-bearing for
+        session routing; a nameless caller can only ever land in the shared file.
+
+    Distinct ``__group__`` / ``__user__`` namespaces keep a group literally named
+    like a caller from colliding with that caller's per-caller file."""
+    partitions = config.get("partitions")
+    if not isinstance(partitions, dict) or not partitions:
+        return ""
+
+    default = str(partitions.get("default", "shared")).lower()
+    if default not in ("shared", "caller"):
+        logger.warning(
+            f"basic_session: partitions.default={default!r} is not "
+            f"'shared' or 'caller' — treating as 'shared'."
+        )
+        default = "shared"
+
+    norm_caller = caller.lower() if caller else None
+
+    # Named-group match: first group (config order) whose members include caller.
+    matched: str | None = None
+    if norm_caller is not None:
+        for group, members in partitions.items():
+            if group == "default":
+                continue
+            if not isinstance(members, list):
+                continue
+            member_set = {str(m).lower() for m in members}
+            if norm_caller in member_set:
+                if matched is not None:
+                    # One connection = one AI = one session. A caller in two
+                    # groups is a config error, not a feature. Shout, keep first.
+                    logger.warning(
+                        f"basic_session: caller {caller!r} appears in multiple "
+                        f"partitions (matched '{matched}', also in '{group}') — "
+                        f"a caller belongs to ONE partition. Using first match "
+                        f"'{matched}'; fix the config."
+                    )
+                    continue
+                matched = group
+    if matched is not None:
+        return f"__group__{_sanitise_key(matched)}"
+
+    if default == "caller" and caller:
+        return f"__user__{_sanitise_key(caller)}"
+    return ""
 
 
 def _sanitise_key(key: str) -> str:
