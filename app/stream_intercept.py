@@ -44,6 +44,26 @@ from . import bridge_native, frame_emit, stream_reconstruct
 logger = logging.getLogger(__name__)
 
 
+# Hard references to in-flight save tasks (on_complete run under cancellation).
+# A task with no reference can be garbage-collected before it finishes, so we
+# hold it here and drop it in the done-callback — this is what makes a save
+# started during client-disconnect actually complete. Module-level so it
+# survives the generator frame being torn down.
+_SAVE_TASKS: set = set()
+
+
+def _on_save_done(task) -> None:
+    """Done-callback for a backgrounded on_complete save: log the outcome (so a
+    cancelled turn's persistence is VISIBLE, not inferred) and drop the hard ref."""
+    _SAVE_TASKS.discard(task)
+    if task.cancelled():
+        logger.warning("stream_intercept: background save task was CANCELLED — turn may not have persisted")
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error(f"stream_intercept: background save task raised: {exc!r}", exc_info=exc)
+
+
 # SSE framing (mirror frame_emit / stream_reconstruct constants).
 _DONE_LINE = b"data: [DONE]\n\n"
 
@@ -245,6 +265,21 @@ async def stream_with_intercepts(
     """
     model = ctx.request.model
     uncapped = max_tool_laps <= 0
+
+    async def _run_on_complete(fn, ctx) -> None:
+        """Run the save (on_complete) with a visibility log on either side, so a
+        cancelled-mid-flight turn leaves a clear trail: we can SEE the save ran to
+        completion rather than inferring it. Runs as the shielded task in the
+        generator's finally."""
+        logger.debug(
+            f"stream_intercept: identity='{ctx.identity.key}' running on_complete "
+            f"(persist turn); loop_ran={ctx.plugin_data.get('intercept.loop_ran')}"
+        )
+        await fn()
+        logger.info(
+            f"stream_intercept: identity='{ctx.identity.key}' on_complete finished "
+            f"(turn persisted)."
+        )
 
     async def generator() -> AsyncIterator[bytes]:
         lap = 0
@@ -453,15 +488,65 @@ async def stream_with_intercepts(
             logger.error(f"stream_intercept network error: {type(e).__name__}: {e!r}")
             yield _content_chunk(f"[network error: {type(e).__name__}]", model)
             yield _DONE_LINE
+        except asyncio.CancelledError:
+            # The client disconnected (or the request scope was torn down). This is
+            # NOT an error and NOT ours to swallow — re-raise so the task unwinds
+            # cleanly. We do NOT fabricate a closing turn (pipe, not author): the
+            # finally still fires and persists whatever REALLY completed. Logged at
+            # INFO so it's visible but not alarming (distinguishes a real disconnect
+            # from the DEBUG-level mcp-session teardown cancels).
+            logger.info(
+                f"stream_intercept: identity='{ctx.identity.key}' stream cancelled "
+                f"mid-flight (client disconnect / scope teardown) at lap {lap} — "
+                f"re-raising; finally will persist what completed."
+            )
+            raise
+        except Exception as e:
+            # A tool/plugin raised, or an unexpected fault. Intercept plugins are
+            # CONTRACTED to return synthetic error tool_results, not raise (D-008) —
+            # but if one breaks that contract we must not leave the client with a
+            # truncated stream and no [DONE]. Emit a REAL error frame (this failure
+            # actually happened — transparent, not fabricated) and close cleanly.
+            logger.error(
+                f"stream_intercept: identity='{ctx.identity.key}' unexpected fault "
+                f"at lap {lap}: {type(e).__name__}: {e!r}",
+                exc_info=True,
+            )
+            yield _content_chunk(f"[bridge error: {type(e).__name__}]", model)
+            yield _DONE_LINE
         finally:
             await client.aclose()
             # Persist the turn — runs even on client disconnect (the finally),
             # so a cancelled long loop still saves what executed. ctx.response
             # holds the last assembled lap; the intercept.loop_ran breadcrumb
             # (set per-lap) tells basic_session to store the full exchange.
+            #
+            # SHIELDED: on the cancellation path this finally runs INSIDE a
+            # cancelling scope, so a bare `await on_complete()` can itself be
+            # re-cancelled before the save completes — silently losing the turn the
+            # comment above promises to keep. asyncio.shield lets the save run to
+            # completion even as the surrounding task unwinds. (shield still
+            # propagates the outer CancelledError afterward, so unwind is unaffected.)
             if on_complete is not None:
+                # Create the save as a REAL task first and keep a hard reference —
+                # a detached task can be GC'd mid-flight, so we register it and only
+                # drop the ref in its done-callback. This is what makes the save
+                # actually LAND under cancellation, not just look shielded.
+                save_task = asyncio.ensure_future(_run_on_complete(on_complete, ctx))
+                _SAVE_TASKS.add(save_task)
+                save_task.add_done_callback(_on_save_done)
                 try:
-                    await on_complete()
+                    await asyncio.shield(save_task)
+                except asyncio.CancelledError:
+                    # Our await was cancelled (outer scope tearing down), but the
+                    # shielded save_task keeps running on the still-live loop until
+                    # done (the done-callback logs its outcome + drops the ref).
+                    # Re-raise for clean unwind; the save is NOT lost.
+                    logger.info(
+                        f"stream_intercept: identity='{ctx.identity.key}' save "
+                        f"shielded through cancellation — completing in background."
+                    )
+                    raise
                 except Exception:
                     logger.error(
                         "stream_intercept on_complete (save) raised", exc_info=True
