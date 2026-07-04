@@ -574,8 +574,16 @@ async def _emit_assembled_frame(full, intercept_tuples, plugin_owned_tools, tool
         msg = choices[0].get("message") or {}
         tcs = msg.get("tool_calls")
         if isinstance(tcs, list) and tcs:
+            # Drop bridge-owned tool_calls (never-leak). Bridge-owned = matches
+            # OWNED_TOOLS OR carries the bridge_native__ prefix at all — the prefix
+            # check catches a MALFORMED bridge-native call (bare `bridge_native__server`
+            # with no method) that OWNED_TOOLS membership alone would miss. Genuine
+            # HARNESS tool_calls (no bridge prefix) are kept and passed through.
             kept = [tc for tc in tcs if not (
-                (n := tool_call_name(tc)) and bridge_native.strip_namespace(n) in owned_all
+                (n := tool_call_name(tc)) and (
+                    bridge_native.strip_namespace(n) in owned_all
+                    or bridge_native.is_namespaced(n)
+                )
             )]
             if kept:
                 msg["tool_calls"] = kept

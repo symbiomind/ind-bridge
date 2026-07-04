@@ -1368,7 +1368,22 @@ async def _dispatch_intercepts(ctx: PipelineCtx, pipeline: list) -> PipelineCtx:
                 plugin_claims.append((plugin, plugin_config, slot, claimed))
 
         if not claimed_any:
-            # Nothing to intercept — pure-harness tool_calls. Pass through.
+            # Nothing an intercept plugin claimed. This is EITHER genuine harness
+            # tool_calls (pass through, the harness runs them) OR a MALFORMED
+            # bridge-native call a model emitted (e.g. a bare `bridge_native__filesystem`
+            # with no `__method`) that matched no OWNED_TOOLS. Neutralize first: strip any
+            # bridge_native__-prefixed call (never-leak by prefix — see
+            # _neutralize_bridge_tool_calls). If that empties the tool_calls it flips
+            # finish_reason → "stop", turning a would-be DANGLING tool_call turn into a
+            # CLEAN TEXT turn — so basic_session can SAVE the exchange (session-truth:
+            # a buddy that ran tools then fizzled on garbage is still truth; store it
+            # coherently, never as a broken frame, never as a void). Genuine harness
+            # tool_calls (no bridge prefix) survive and pass through unchanged.
+            _neutralize_bridge_tool_calls(ctx, intercept_tuples)
+            # Breadcrumb: this turn DID run a bridge tool loop (the queries that
+            # resolved before the fizzle), so basic_session persists the FULL exchange
+            # (user + resolved tool turns + partial text), not just the final text.
+            ctx.plugin_data["intercept.loop_ran"] = True
             return ctx
 
         if unhandled_indices:
@@ -1625,7 +1640,16 @@ def _neutralize_bridge_tool_calls(ctx: PipelineCtx, intercept_tuples: list) -> N
     dropped = []
     for tc in tool_calls:
         name = _tool_call_name(tc)
-        if name and bridge_native.strip_namespace(name) in owned_all:
+        # Bridge-owned-must-strip if EITHER (a) the stripped name matches a plugin's
+        # OWNED_TOOLS, OR (b) it carries the bridge_native__ prefix AT ALL. (b) is the
+        # never-leak-by-PREFIX guard: a MALFORMED bridge-native call (e.g. a bare
+        # `bridge_native__filesystem` with no `__method`, which a small model may emit)
+        # strips to `filesystem` — NOT a full OWNED_TOOLS entry — so (a) alone would let
+        # it fall through to the harness as if it were a harness tool. It isn't: a
+        # bridge_native__-prefixed call must NEVER reach the harness, malformed or not.
+        # (a) still preserves genuine HARNESS tool_calls (no bridge_native__ prefix).
+        if name and (bridge_native.strip_namespace(name) in owned_all
+                     or bridge_native.is_namespaced(name)):
             dropped.append(name)
         else:
             kept.append(tc)
