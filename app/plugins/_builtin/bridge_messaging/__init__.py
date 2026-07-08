@@ -52,6 +52,16 @@ Likewise ``trust`` is hardcoded ``bridge_messaging`` and the privilege attrs in
 it). All of these ride in the bridge-SIGNED ``<caller>`` block, so the recipient's
 ``verify_inbound`` makes them immutable. Mint-side gate + verify-side seal.
 
+The bridge also stamps two bridge-owned ``<caller>`` attributes by default: ``tool``
+(the send tool's namespaced name, for attribution) and ``information`` (a reply-
+instruction so a recipient — especially a memory-less guest — knows to reply in chat,
+not re-call the send tool). ``information``'s TEXT comes from the RECIPIENT role's
+``bridge_messaging.information`` (it's the receiving agent's own instruction), falling
+back to ``_DEFAULT_INFORMATION``; set that key ``false``/"" to omit. Both are reserved
+(a caller can't set/override them) and signed. This is why the reply-contract lives in
+the signed ``<caller>`` and NEVER in the message body: the sender never spoke it, so it
+must not appear in the sender's voice (voice-purity).
+
 Delivery mechanic: the synthetic caller is carried into the recipient role's pipeline
 by driving ``execute(carrier_identity, body, headers)`` where ``body`` stamps the
 reserved ``_bridge_caller`` / ``_bridge_trust`` / ``_bridge_storage`` / ``_cron_additional``
@@ -120,11 +130,27 @@ collisions on one identity."""
 # signing wrappers are bridge-owned. An agent-supplied `additional` carrying any of
 # these is rejected (forge guard). `caller` is also simply absent from the tool schema
 # (impersonation guard) — this set catches it defensively if it ever appears in args.
+#
+# `information` is ALSO bridge-owned: it's a reply-instruction the bridge stamps onto the
+# delivered <caller> by default (text from the RECIPIENT role's config). A caller trying to
+# set it via `additional` is rejected — the recipient decides what instruction they need,
+# not the sender.
 _RESERVED_ATTRS = frozenset({
-    "caller", "trust", "tool", "storage", "signed", "timestamp",
+    "caller", "trust", "tool", "storage", "signed", "timestamp", "information",
 })
 
 _BRIDGE_TRUST = "bridge_messaging"
+
+# Default reply-instruction stamped as information="…" on the delivered <caller>, so a
+# recipient (especially a memory-less guest) knows to reply in chat rather than fighting the
+# send tool. Overridable per-RECIPIENT-role via bridge_messaging.information; set that to
+# false/"" to omit. Rides in the SIGNED <caller> — never in the sender's message voice
+# (voice-purity: instruction lives in context, not in words the sender never spoke).
+_DEFAULT_INFORMATION = (
+    "You are receiving a message from another agent via bridge_messaging. To reply, "
+    "just respond normally in chat — no tool call needed; the bridge routes your reply "
+    "back to the sender."
+)
 
 
 # ---------------------------------------------------------------------------
@@ -277,7 +303,8 @@ _TOOL_DEFINITIONS = {
                         "description": (
                             "Optional extra context shown to the recipient as tags on "
                             "your caller (e.g. a subject or mood). Decorative only — "
-                            "reserved trust keys are rejected."
+                            "reserved keys (caller/trust/tool/storage/information) are "
+                            "bridge-owned and rejected if you set them."
                         ),
                     },
                     "output": {
@@ -542,6 +569,19 @@ async def _handle_send(ctx: "PipelineCtx", args: dict, config: dict) -> str:
         body["_bridge_storage"] = "false"
     extra_additional = dict(raw_additional)
     extra_additional["tool"] = bridge_native.apply_namespace("bridge_messaging_send")
+    # `information` — a bridge-owned reply-instruction stamped onto the SIGNED <caller> so
+    # the recipient (esp. a memory-less guest) knows to reply in chat, not re-call the send
+    # tool. The TEXT comes from the RECIPIENT role's bridge_messaging block (it's THEIR
+    # instruction — what the receiving agent needs to see), falling back to the built-in
+    # default. `information: false`/"" on that role omits it. Bridge-authored + signed →
+    # a calling agent can't set or override it (reserved above). This lives in context, not
+    # in the message body — the sender never "said" it (voice-purity: instruction belongs
+    # in the signed envelope, never in words the sender didn't speak).
+    from app import config as config_mod
+    recipient_cfg = _role_bridge_messaging_cfg(config_mod.resolve_role(target) or {})
+    info = recipient_cfg.get("information", _DEFAULT_INFORMATION)
+    if info:
+        extra_additional["information"] = str(info)
     body["_cron_additional"] = extra_additional  # reuses the proven per-turn additional inject
 
     carrier = entry["carrier_identity_key"]
