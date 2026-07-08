@@ -26,8 +26,8 @@ HTTP call. Per **D-005**: bridge_sign wraps the walk, never as tuples.
 Per **D-006**: only 8 canonical slots — ``session.context.plugins`` and
 ``session.response.plugins`` don't exist.
 
-See ``CLAUDE.md`` for the architecture cheat-sheet,
-``~/Documents/ind-v4-decisions.md`` for the decisions referenced above.
+See ``CLAUDE.md`` for the architecture cheat-sheet and the project's
+V4 design docs (the decisions log) for the decisions referenced above.
 """
 
 from __future__ import annotations
@@ -335,6 +335,7 @@ async def execute(
                 tool_call_name=_tool_call_name,
                 run_intercept_plugin=_run_intercept_plugin,
                 build_assistant_turn=_build_assistant_turn_from_response,
+                make_tool_message=_make_tool_message,
                 max_tool_laps=ctx.max_tool_laps,
                 on_complete=_save_after_stream,
             )
@@ -1420,26 +1421,81 @@ async def _dispatch_intercepts(ctx: PipelineCtx, pipeline: list) -> PipelineCtx:
             ctx.plugin_data["intercept.loop_ran"] = True
             return ctx
 
-        if unhandled_indices:
-            # Mixed bridge + harness tool_calls. V3 fall-back per the plan:
-            # log + pass through unchanged (lose bridge result). Q-M
-            # parks the splicing upgrade.
-            unhandled_names = [
+        # Mixed tool_calls: some claimed by a bridge plugin, some not. An
+        # unclaimed call is one of two very different things:
+        #   (a) HARNESS-REAL — a tool the CLIENT/harness advertised in this
+        #       request's `tools` (e.g. a harness-side memory_stats_mcp_personal).
+        #       A real harness DOES sit downstream and WILL run it. We must pass
+        #       it through untouched (neutralize only the bridge calls) — exactly
+        #       the original behaviour. Synthesizing a "no handler" here would
+        #       BREAK a working harness tool (a real regression that surfaced when
+        #       a harness-owned identity mixed its own tool with a bridge one).
+        #   (b) ORPHAN — a name NEITHER a bridge plugin claimed NOR the harness
+        #       advertised (e.g. a hallucinated bridge_native__weather__get_forecast,
+        #       or a malformed small-model name). NOTHING downstream will answer it.
+        #
+        # Harness-real present → there's a harness; use the pass-through path
+        # (neutralize bridge calls, leave harness calls + finish_reason so the
+        # harness runs them). Q-M's harness-downstream splicing upgrade (execute
+        # bridge tools AND splice results for the harness's next turn) is still
+        # parked — but pass-through is correct and non-lossy here because a real
+        # harness closes the loop.
+        #
+        # ONLY orphans (no harness-real) → the bridge-owned turn-loss case:
+        # there is no downstream to answer them, so execute the claimed bridge
+        # tools + splice a synthetic "no handler" tool_result for each orphan +
+        # re-call → the turn closes with text and basic_session stores the FULL
+        # exchange (session-truth). Never-leak is unchanged:
+        # bridge_native__ calls are executed bridge-side; only orphan names get a
+        # synthetic stand-in.
+        harness_tool_names = _harness_advertised_tool_names(ctx)
+        harness_real_indices = {
+            i for i in unhandled_indices
+            if (_tool_call_name(tool_calls[i]) or "") in harness_tool_names
+        }
+        orphan_indices = unhandled_indices - harness_real_indices
+
+        if harness_real_indices:
+            # A genuine harness tool is in play → pass through (original path).
+            harness_names = sorted(
                 _tool_call_name(tool_calls[i]) or "(anonymous)"
-                for i in sorted(unhandled_indices)
-            ]
-            logger.warning(
+                for i in harness_real_indices
+            )
+            logger.info(
                 f"Identity '{ctx.identity.key}' — mixed bridge+harness "
-                f"tool_calls (bridge-claimed by intercept plugins, "
-                f"harness-pending: {unhandled_names}). Neutralizing the bridge "
-                f"tool_calls (they must never reach the harness) and passing "
-                f"the harness tool_calls through. (Q-M parks splicing bridge "
-                f"results alongside harness tool_calls.)"
+                f"tool_calls; harness-advertised call(s) present ({harness_names}) "
+                f"→ neutralizing bridge tool_calls and passing the harness "
+                f"tool_calls through for the harness to run. (Q-M harness-"
+                f"downstream splicing still parked.)"
             )
             _neutralize_bridge_tool_calls(ctx, intercept_tuples)
             return ctx
 
-        # All claimed by intercept plugins — execute them, splice results,
+        # Only orphan unclaimed calls remain — bridge-owned turn-loss case.
+        synthetic_unhandled: list[dict] = []
+        if orphan_indices:
+            orphan_names = [
+                _tool_call_name(tool_calls[i]) or "(anonymous)"
+                for i in sorted(orphan_indices)
+            ]
+            logger.info(
+                f"Identity '{ctx.identity.key}' — mixed bridge+orphan "
+                f"tool_calls (bridge-claimed by intercept plugins; no handler "
+                f"for: {orphan_names}). Executing the bridge tool_calls and "
+                f"splicing a synthetic 'no handler' result for the orphan(s) so "
+                f"the turn closes cleanly (Q-M, bridge-owned case)."
+            )
+            synthetic_unhandled = [
+                _make_tool_message(
+                    tool_calls[i],
+                    f"[no handler for tool "
+                    f"'{_tool_call_name(tool_calls[i]) or '?'}' in this "
+                    f"bridge-owned turn]",
+                )
+                for i in sorted(orphan_indices)
+            ]
+
+        # All bridge calls claimed by intercept plugins — execute them, splice results,
         # and re-call the resource step. The runaway guardrail only fires for a
         # finite cap; an uncapped identity (max_tool_laps: 0) runs until the
         # model stops calling tools — the never-leak guard still protects the
@@ -1463,7 +1519,10 @@ async def _dispatch_intercepts(ctx: PipelineCtx, pipeline: list) -> PipelineCtx:
         # Walk plugin claims; each plugin handles its claimed tool_calls
         # and returns tool_result messages to splice in. Errors become
         # synthetic tool_result messages so the agent narrates the failure.
-        tool_result_messages: list[dict] = []
+        # Seed with any synthetic "no handler" results for unclaimed calls in a
+        # mixed turn (built above) so the assistant turn's tool_calls each get a
+        # matching tool_result — no dangling call, frame closes cleanly.
+        tool_result_messages: list[dict] = list(synthetic_unhandled)
         for plugin, plugin_config, slot, claimed in plugin_claims:
             results = await _run_intercept_plugin(
                 plugin, plugin_config, ctx, slot, claimed,
@@ -1708,6 +1767,26 @@ def _neutralize_bridge_tool_calls(ctx: PipelineCtx, intercept_tuples: list) -> N
         f"bridge tool_call(s) so they don't reach the harness: {dropped}"
         + (f"; {len(kept)} harness tool_call(s) preserved" if kept else "")
     )
+
+
+def _harness_advertised_tool_names(ctx: PipelineCtx) -> set[str]:
+    """Names the CLIENT/harness advertised in this request's ``tools`` — i.e.
+    tools a real downstream harness (LibreChat, OpenClaw…) will execute itself.
+
+    mcp_client injects only ``bridge_native__``-prefixed tools into
+    ``ctx.request.tools``; every NON-prefixed entry is therefore a genuine
+    harness-advertised tool. Used to tell a real harness tool_call (pass it
+    through — a harness runs it) apart from an ORPHAN call that nothing
+    downstream will ever answer (synthesize a 'no handler' result so the
+    bridge-owned turn still closes and stores)."""
+    names: set[str] = set()
+    for t in (ctx.request.tools or []):
+        if not isinstance(t, dict):
+            continue
+        name = (t.get("function") or {}).get("name")
+        if isinstance(name, str) and name and not bridge_native.is_namespaced(name):
+            names.add(name)
+    return names
 
 
 def _build_assistant_turn_from_response(ctx: PipelineCtx) -> dict:

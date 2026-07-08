@@ -60,8 +60,38 @@ Config (operator writes the server map ONCE at role.plugins)::
             mcp_client: {}                             # inject tools
 
 Constraints: a ``server_key`` must NOT contain ``__`` (it collides with the
-sub-namespace separator — warn-and-skip). Optional per-server ``tools:``
-allowlist restricts which discovered tools are offered.
+sub-namespace separator — warn-and-skip).
+
+Per-server ACL + param injection (policy layer, enforced at BOTH injection and
+dispatch — a denied tool is neither offered NOR callable-from-history)::
+
+    roles:
+      my_agent_role:
+        plugins:
+          mcp_client:
+            diary:
+              resource: my_agent_diary_mcp
+              allow: [retrieve_memories]     # whitelist (only these visible/callable)
+              deny:  [store_memory]          # blacklist (beats allow → deny-wins)
+              params:                         # gateway-level arg injection
+                append:                       # SHALLOW overwrite of named keys
+                  retrieve_memories:
+                    source: "my_agent"        # stamped server-side, model can't override
+                # replace:                    # discard model args, use these
+                #   some_tool: { query: "fixed" }
+
+  * ``allow`` — whitelist. If present, ONLY listed tools are exposed/callable.
+    ``tools:`` is a back-compat ALIAS for ``allow`` (same semantics; unioned if
+    both present).
+  * ``deny`` — blacklist. Removes tools even from ``allow``. On overlap, deny
+    wins (more-restrictive-wins, fail-safe).
+  * ``params.append`` — per-tool dict; SHALLOW-overwrites the named top-level arg
+    keys onto the call verbatim (no deep-merge, no list-concat), clobbering the
+    model's value. The sovereign-stamp fix (e.g. forcing ``source``).
+  * ``params.replace`` — per-tool dict; discards the model's args entirely and
+    substitutes the operator's. append runs after replace (append wins overlap).
+  * Values are injected verbatim — schema-agnostic; a wrong type is rejected by
+    the MCP server and narrated as a tool-error (operator owns config).
 
 Parked for future-us: reconnect/retry of a server that was down at boot (needs
 more dogfooding/research); cross-plugin collisions among dynamic tools (can't be
@@ -153,6 +183,24 @@ def OWNED_TOOLS() -> list[str]:
     for (resource_key, tool) in _tool_defs:  # only DISCOVERED (resource, tool)
         for server_key in resource_to_aliases.get(resource_key, set()):
             names.add(_join_name(server_key, tool))
+
+    # Tolerant claim for segment-less names (model dropped the <server_key>__
+    # middle — e.g. `search` for `memory__search`). Claim the BARE name too, but
+    # ONLY when it is globally unambiguous — exactly one resource owns a tool by
+    # that name. This lets core's claim-matcher (strip_namespace(name) in owned)
+    # recognize the malformed call as bridge-owned instead of misclassifying it
+    # as harness-pending (which tripped the mixed-calls turn-loss). Dispatch
+    # re-confirms sole ownership per-role via _resolve_single_owner, so this
+    # presence-claim never misroutes.
+    # Ambiguous bare names (>1 owning resource) are deliberately left out → they
+    # fall to the synthetic 'no handler' path rather than a silent wrong guess.
+    resources_by_tool: dict[str, set[str]] = {}
+    for (resource_key, tool) in _tool_defs:
+        resources_by_tool.setdefault(tool, set()).add(resource_key)
+    for tool, resources in resources_by_tool.items():
+        if len(resources) == 1:
+            names.add(tool)
+
     return sorted(names)
 
 
@@ -173,6 +221,31 @@ def _split_name(clean_name: str) -> tuple[str, str] | None:
         return None
     server_key, tool_name = clean_name.split(_NS_SEP, 1)
     return server_key, tool_name
+
+
+def _resolve_single_owner(bare_tool: str, server_to_resource: dict[str, str]) -> str | None:
+    """Tolerant routing for a segment-less bridge name. Small models (9b,
+    and some larger ones) sometimes emit ``bridge_native__search`` — DROPPING the
+    middle ``<server_key>__`` segment — so ``_split_name`` returns None, the name
+    can't be claimed or dispatched, and a genuinely-bridge call gets
+    misclassified as harness-pending → the mixed-calls path fires and (pre-fix)
+    the turn was lost.
+
+    Given a BARE tool name (no ``__``) and THIS identity's
+    ``{server_key: resource_key}`` map, return the sole ``server_key`` whose
+    resource actually owns a tool of that name, IFF exactly one does. Zero or
+    >1 owners → None (ambiguous; never guess across owners — enforcement, not
+    prompting; the caller falls back to the synthetic 'no handler' path). The
+    reconstructed ``server_key__tool`` then routes normally through the existing
+    per-role gate + ACL + route lookup — no dispatch shortcut, same security."""
+    if _NS_SEP in bare_tool:
+        return None  # not segment-less; normal split applies
+    owners = [
+        server_key
+        for server_key, resource_key in server_to_resource.items()
+        if (resource_key, bare_tool) in _tool_defs
+    ]
+    return owners[0] if len(owners) == 1 else None
 
 
 # ---------------------------------------------------------------------------
@@ -673,8 +746,9 @@ def modify_context(ctx: "PipelineCtx", config: dict) -> "PipelineCtx":
     if not server_to_resource:
         return ctx  # this role declares no MCP servers — offer nothing
 
-    # Per-server allowlists (role.plugins.mcp_client.<server>.tools) — applied
-    # here, not at discovery, because the registry is resource-keyed and shared.
+    # Per-server ACL (role.plugins.mcp_client.<server>.{allow,deny,tools}) —
+    # applied here, not at discovery, because the registry is resource-keyed and
+    # shared across roles. `tools:` is folded into `allow` by _tool_permitted.
     role_server_map = _role_server_map(ctx)
 
     existing = {
@@ -684,13 +758,13 @@ def modify_context(ctx: "PipelineCtx", config: dict) -> "PipelineCtx":
     }
     to_add = []
     for server_key, resource_key in server_to_resource.items():
-        per_server_allow = (role_server_map.get(server_key) or {}).get("tools")
+        server_cfg = role_server_map.get(server_key) or {}
         for (res, raw_tool), d in _tool_defs.items():
             if res != resource_key:
                 continue
             wire_clean = _join_name(server_key, raw_tool)  # server_key__tool
-            # per-server allowlist (the server's own `tools:` list)
-            if per_server_allow is not None and raw_tool not in per_server_allow:
+            # per-server ACL (allow/deny + `tools:` alias, deny-wins)
+            if not _tool_permitted(raw_tool, server_cfg):
                 continue
             # context-level allowlist (`tools:` on this context block)
             if allow is not None and not _allowed(wire_clean, allow):
@@ -720,6 +794,99 @@ def _allowed(clean_name: str, allow: list) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Per-server ACL + param-injection policy (allow / deny / params)
+#
+# A per-role, per-server policy layer sitting between a bridge resident and an
+# MCP server. Enforcement, not prompting: a small/untrusted model (e.g. a
+# confabulating local model) cannot see a denied tool (injection seam) NOR call
+# one that arrives from crafted history (dispatch seam), and cannot fill a
+# sovereign argument the operator has stamped server-side (param injection).
+#
+# This is the sovereign-signal principle applied to MCP: the model may DESCRIBE
+# itself in a tool call, but never DECLARE fields the operator reserves — same
+# line as the bridge auto-stamping <caller> rather than trusting a send arg.
+# ---------------------------------------------------------------------------
+
+def _server_cfg_for_role(ctx: "PipelineCtx", server_key: str) -> dict:
+    """THIS role's raw config block for one server_key
+    (``role.plugins.mcp_client.<server_key>``), or ``{}`` if absent. Reuses
+    ``_role_server_map`` so injection and dispatch read the SAME block."""
+    return _role_server_map(ctx).get(server_key) or {}
+
+
+def _permit_lists(server_cfg: dict) -> tuple[list | None, list]:
+    """Extract (allow, deny) from a server block. ``tools:`` is a back-compat
+    alias for ``allow`` (same whitelist semantics); if BOTH are present they're
+    unioned (either whitelist entry admits the tool). Returns ``allow=None`` when
+    no whitelist is declared (→ all tools pass the allow stage). Non-list values
+    are ignored (warn) so a malformed policy fails OPEN on allow / CLOSED on deny
+    is avoided — both just degrade to 'not declared'."""
+    def _as_list(val, field):
+        if val is None:
+            return None
+        if isinstance(val, list):
+            return val
+        logger.warning(
+            f"mcp_client: '{field}' must be a list; got {type(val).__name__}. "
+            f"Ignoring it."
+        )
+        return None
+
+    allow = _as_list(server_cfg.get("allow"), "allow")
+    tools_alias = _as_list(server_cfg.get("tools"), "tools")
+    if allow is None:
+        allow = tools_alias
+    elif tools_alias is not None:
+        allow = list(allow) + tools_alias  # union of both whitelists
+    deny = _as_list(server_cfg.get("deny"), "deny") or []
+    return allow, deny
+
+
+def _tool_permitted(raw_tool: str, server_cfg: dict) -> bool:
+    """Single source of truth for the per-server ACL, used by BOTH seams.
+    ``deny`` beats ``allow`` on overlap (more-restrictive-wins, fail-safe).
+    Matches on the RAW (bare) tool name — the per-server block names tools
+    without the server_key prefix."""
+    allow, deny = _permit_lists(server_cfg)
+    if raw_tool in deny:
+        return False
+    if allow is not None and raw_tool not in allow:
+        return False
+    return True
+
+
+def _apply_param_policy(args: dict, raw_tool: str, server_cfg: dict) -> dict:
+    """Apply ``params.replace`` then ``params.append`` for one tool call.
+
+    - ``replace[raw_tool]`` (if a dict) discards the model's args entirely and
+      substitutes the operator's object.
+    - ``append[raw_tool]`` (if a dict) SHALLOW-overwrites the named top-level
+      keys onto the args (``dict.update`` — no deep-merge, no list-concat),
+      clobbering whatever the model supplied. append runs AFTER replace, so it
+      wins any overlapping key (the sovereign-stamp guarantee).
+
+    Values are injected verbatim — no type coercion/validation (schema-agnostic;
+    a wrong type is rejected by the MCP server and narrated as a tool-error).
+    Returns the (possibly new) args dict."""
+    params = server_cfg.get("params")
+    if not isinstance(params, dict):
+        return args
+
+    replace = params.get("replace")
+    if isinstance(replace, dict):
+        repl = replace.get(raw_tool)
+        if isinstance(repl, dict):
+            args = copy.deepcopy(repl)
+
+    append = params.get("append")
+    if isinstance(append, dict):
+        add = append.get(raw_tool)
+        if isinstance(add, dict):
+            args.update(copy.deepcopy(add))
+    return args
+
+
+# ---------------------------------------------------------------------------
 # handle_tool_calls — route to the right MCP server and execute (D-008)
 # ---------------------------------------------------------------------------
 
@@ -735,17 +902,28 @@ async def handle_tool_calls(ctx: "PipelineCtx", config: dict) -> str:
         return "[mcp_client error: no claimed tool_call on ctx.plugin_data]"
 
     name = tc.get("function", {}).get("name")
+    server_to_resource = _role_server_to_resource(ctx)
     split = _split_name(name)
     if split is None:
-        return f"[mcp_client error: tool name '{name}' has no server sub-namespace]"
-    server_key, raw_tool = split
+        # Segment-less name (model dropped the <server_key>__ middle). If exactly
+        # one of this role's servers owns a tool by this bare name, route it there
+        # (tolerant single-owner disambiguation — never guess across owners).
+        sole_owner = _resolve_single_owner(name or "", server_to_resource)
+        if sole_owner is None:
+            return f"[mcp_client error: tool name '{name}' has no server sub-namespace]"
+        logger.info(
+            f"mcp_client: identity '{ctx.identity.key}' — segment-less tool "
+            f"'{name}' resolved to sole owner '{sole_owner}' (tolerant routing)."
+        )
+        server_key, raw_tool = sole_owner, name
+    else:
+        server_key, raw_tool = split
 
     # Per-role server gate (security): discovery + routes are GLOBAL and
     # resource-keyed, so refuse to dispatch a call to a server THIS role didn't
     # configure — even if the call arrived from history or a crafted request.
     # Resolving server_key→resource here ALSO routes to the role's OWN resource:
     # two roles' same-named 'filesystem' servers each hit their own endpoint.
-    server_to_resource = _role_server_to_resource(ctx)
     resource_key = server_to_resource.get(server_key)
     if resource_key is None:
         logger.warning(
@@ -755,6 +933,22 @@ async def handle_tool_calls(ctx: "PipelineCtx", config: dict) -> str:
         return (
             f"[mcp_client error: tool '{name}' is not available to this identity "
             f"(server '{server_key}' not configured for this role)]"
+        )
+
+    # Per-server ACL gate (security): re-check allow/deny at DISPATCH, not just
+    # at injection — a denied tool can arrive from crafted history even though it
+    # was never offered. Same belt-and-suspenders posture as the server gate
+    # above. Reads the SAME per-server block modify_context filtered on.
+    server_cfg = _server_cfg_for_role(ctx, server_key)
+    if not _tool_permitted(raw_tool, server_cfg):
+        logger.warning(
+            f"mcp_client: identity '{ctx.identity.key}' tried to call '{name}' "
+            f"but tool '{raw_tool}' is denied by the server '{server_key}' policy "
+            f"— refused."
+        )
+        return (
+            f"[mcp_client error: tool '{name}' is not permitted for this identity "
+            f"(blocked by the '{server_key}' allow/deny policy)]"
         )
 
     route = _tool_routes.get((resource_key, raw_tool))
@@ -773,6 +967,11 @@ async def handle_tool_calls(ctx: "PipelineCtx", config: dict) -> str:
         return f"[mcp_client error: could not parse arguments for '{name}']"
     if not isinstance(args, dict):
         args = {}
+
+    # Gateway-level param injection (replace then append) — stamp sovereign
+    # fields the model shouldn't fill itself (e.g. `source`), overriding whatever
+    # it supplied, BEFORE the call reaches the MCP server. See _apply_param_policy.
+    args = _apply_param_policy(args, raw_tool, server_cfg)
 
     result = await _call_tool(conn, raw_tool_name, args)
     result_text = _stringify(result)

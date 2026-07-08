@@ -54,13 +54,49 @@ roles:
         mcp_client: {}                            # inject tools
 ```
 
+## Per-server ACL + param injection (`allow` / `deny` / `params`)
+
+A declarative, per-role, per-server policy layer between a resident and an MCP
+server — **enforcement, not prompting**. A denied tool is neither *offered* (the
+model never sees it) nor *callable from crafted history* (dispatch re-checks).
+Param injection stamps sovereign fields the model shouldn't fill itself.
+
+```yaml
+roles:
+  my_agent_role:
+    plugins:
+      mcp_client:
+        diary:
+          resource: my_agent_diary_mcp
+          allow: [retrieve_memories]        # whitelist — only these visible/callable
+          deny:  [store_memory]             # blacklist — beats allow (deny-wins)
+          params:                           # gateway-level argument injection
+            append:                         # SHALLOW overwrite of named keys
+              retrieve_memories:
+                source: "my_agent"          # stamped server-side; model can't override
+            # replace:                      # discard the model's args entirely
+            #   some_tool: { query: "fixed" }
+```
+
+- **`allow`** — whitelist. If present, only listed tools are exposed/callable.
+  Per-server `tools:` is a back-compat **alias** for `allow` (unioned if both).
+- **`deny`** — blacklist. Removes a tool even from an `allow` list. On overlap,
+  **deny wins** (more-restrictive-wins, fail-safe).
+- **`params.append`** — per-tool dict; **shallow-overwrites** the named top-level
+  argument keys verbatim (no deep-merge, no list-concat), clobbering whatever the
+  model supplied. The fix for a small model inventing a bogus `source`.
+- **`params.replace`** — per-tool dict; discards the model's args and substitutes
+  the operator's. `append` runs after `replace`, so it wins overlapping keys.
+- Injected values are passed through **verbatim** — the bridge is schema-agnostic;
+  a wrong type is rejected by the MCP server and narrated as a tool-error.
+
 ## Constraints
 
 - A `server_key` must **not** contain `__` (collides with the sub-namespace
   separator) — such a server is warned-and-skipped.
-- Optional per-server `tools:` allowlist restricts which discovered tools are
-  offered. An allowlist on the `context.plugins` block accepts either the full
-  `server__tool` name or the bare tool name.
+- An allowlist on the `context.plugins` block accepts either the full
+  `server__tool` name or the bare tool name (this is a separate, outer layer from
+  the per-server `allow`/`deny` above; a tool must pass both).
 - Author the server map once at role level — same-named keys across cascade
   levels deep-merge.
 

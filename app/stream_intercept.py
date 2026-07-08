@@ -244,6 +244,7 @@ async def stream_with_intercepts(
     tool_call_name: Callable[[dict], "str | None"],
     run_intercept_plugin: Callable[..., Any],
     build_assistant_turn: Callable[[Any], dict],
+    make_tool_message: Callable[[dict, str], dict],
     max_tool_laps: int,
     on_complete: "Callable[[], Any] | None" = None,
 ):
@@ -417,11 +418,13 @@ async def stream_with_intercepts(
                     if claimed:
                         plugin_claims.append((plugin, plugin_config, slot, claimed))
 
-                # Mixed bridge+harness OR nothing-claimed → we can't transparently
-                # intercept. Forward the assembled frame (minus any bridge-native
-                # calls) as the real reply + DONE. (Never leak bridge_native to the
-                # client — strip those, emit whatever remains as a normal frame.)
-                if unhandled or not plugin_claims:
+                # Nothing bridge-claimed → transparent forward. Either a genuine
+                # pure-harness turn (a Shape-3 identity WITH a harness downstream
+                # runs it) or a fully-malformed frame. Emit the assembled frame
+                # minus any bridge_native calls (never leak) + DONE. (The
+                # pure-harness-in-a-bridge-owned-turn variant is Q-M's still-open
+                # sub-case — not addressed here.)
+                if not plugin_claims:
                     async for sse in _emit_assembled_frame(
                         full, intercept_tuples, plugin_owned_tools, tool_call_name
                     ):
@@ -429,6 +432,65 @@ async def stream_with_intercepts(
                     yield _DONE_LINE
                     ctx.plugin_data["stream_intercept.closed"] = True
                     return
+
+                # Mixed: some claimed, some not. Split the unclaimed into
+                # HARNESS-REAL (advertised by the client/harness in request.tools
+                # → a real harness downstream runs them, pass through untouched —
+                # NOT synthesizing, else we break a working harness tool like
+                # LibreChat's memory_stats_mcp_personal-mcp) vs ORPHAN (nothing
+                # downstream will ever answer → synthesize 'no handler'). Mirrors
+                # the buffered executor's _harness_advertised_tool_names split.
+                harness_tool_names = {
+                    n for t in (ctx.request.tools or [])
+                    if isinstance(t, dict)
+                    and (n := (t.get("function") or {}).get("name"))
+                    and isinstance(n, str)
+                    and not bridge_native.is_namespaced(n)
+                }
+                harness_real = {
+                    i for i in unhandled
+                    if (tool_call_name(tool_calls[i]) or "") in harness_tool_names
+                }
+                orphan = unhandled - harness_real
+
+                if harness_real:
+                    # A genuine harness tool is present → pass through (original
+                    # path): emit the assembled frame minus bridge-native calls,
+                    # leaving the harness call for the harness to run.
+                    logger.info(
+                        f"stream_intercept: identity='{ctx.identity.key}' — mixed "
+                        f"bridge+harness; harness-advertised call(s) present → "
+                        f"passing harness tool_calls through (Q-M harness-"
+                        f"downstream splicing still parked)."
+                    )
+                    async for sse in _emit_assembled_frame(
+                        full, intercept_tuples, plugin_owned_tools, tool_call_name
+                    ):
+                        yield sse
+                    yield _DONE_LINE
+                    ctx.plugin_data["stream_intercept.closed"] = True
+                    return
+
+                # Only orphans remain — the bridge-owned turn-loss case.
+                # Execute the claimed bridge tools + splice a synthetic 'no
+                # handler' result for each orphan, then loop → turn closes with
+                # text and basic_session stores the full exchange.
+                synthetic_unhandled: list[dict] = [
+                    make_tool_message(
+                        tool_calls[i],
+                        f"[no handler for tool "
+                        f"'{tool_call_name(tool_calls[i]) or '?'}' in this "
+                        f"bridge-owned turn]",
+                    )
+                    for i in sorted(orphan)
+                ]
+                if synthetic_unhandled:
+                    logger.info(
+                        f"stream_intercept: identity='{ctx.identity.key}' — "
+                        f"mixed bridge+orphan tool_calls; executing bridge "
+                        f"call(s) and splicing {len(synthetic_unhandled)} "
+                        f"synthetic 'no handler' result(s) (Q-M, bridge-owned)."
+                    )
 
                 # Lap cap (finite) → stop looping; deliver what we have.
                 if not uncapped and lap >= max_tool_laps:
@@ -471,7 +533,13 @@ async def stream_with_intercepts(
                         )
                     except asyncio.TimeoutError:
                         yield _keepalive_chunk(model)  # heartbeat; loop again
-                tool_result_messages: list[dict] = tool_task.result()
+                # Seed with any synthetic "no handler" results for the unclaimed
+                # calls in a mixed turn so every tool_call on the assistant turn
+                # has a matching tool_result — no dangling call, frame closes.
+                tool_result_messages: list[dict] = [
+                    *synthetic_unhandled,
+                    *tool_task.result(),
+                ]
 
                 ctx.request.messages = [
                     *ctx.request.messages,
