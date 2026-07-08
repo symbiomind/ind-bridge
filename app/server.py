@@ -15,8 +15,8 @@ working as designed:
     Identity with listener plugin = bridge opens that listener
     Otherwise = silence
 
-See ``CLAUDE.md`` (project root) and ``~/Documents/ind-v4-brainstorm.md``
-for the full contract. D-001 in ``~/Documents/ind-v4-decisions.md``
+See ``CLAUDE.md`` (project root) and the project's V4 design docs
+for the full contract. D-001 in the decisions log
 establishes ``setup_listener`` as the listener capability's entry point.
 """
 

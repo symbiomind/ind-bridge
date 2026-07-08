@@ -37,10 +37,9 @@ V4 is **NOT wire-compatible with V3** signing. V3's HMAC was over
 ``trust|name|timestamp`` only; V4 hashes the entire inner block. This is
 the deliberate fix D-005 documents.
 
-See ``CLAUDE.md`` for the architecture cheat-sheet,
-``~/Documents/ind-v4-decisions.md`` (D-005) for the security reasoning,
-and ``~/Documents/ind-v4-brainstorm.md`` ("`context:` and Security —
-Core Primitives") for the full spec.
+See ``CLAUDE.md`` for the architecture cheat-sheet and the project's
+V4 design docs — the decisions log (D-005) for the security reasoning, and
+the brainstorm ("`context:` and Security — Core Primitives") for the full spec.
 """
 
 from __future__ import annotations

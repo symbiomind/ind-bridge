@@ -37,8 +37,8 @@ Capability methods (each capability has its own method on the plugin module):
       Plugin IS the resource — terminates the pipeline, no outbound call.
       Fires for plugins declaring ``produce_response`` in ``resource.plugins``.
 
-See ``~/Documents/ind-v4-brainstorm.md`` (*The Plugin Capability Contract*)
-for the full contract, and ``CLAUDE.md`` for the cheat-sheet.
+See ``CLAUDE.md`` for the cheat-sheet and the project's V4 design docs
+(*The Plugin Capability Contract*) for the full contract.
 """
 
 from __future__ import annotations

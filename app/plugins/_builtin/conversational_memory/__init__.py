@@ -14,7 +14,7 @@ V4 capability shape (declared once under *.context.plugins, both fire):
                       dedup-shown, inject signed XML into ctx.bridge_context.
     post_response   — store: skip housekeeping turns, build XML pair, fire
                       to memory-mcp-ce after the response has reached the
-                      client. Per the spec note in ind-v4-brainstorm.md,
+                      client. Per the V4 design spec,
                       `post_response` is permitted in *.context.plugins
                       slots when the plugin pairs recall + store as one
                       logical knob set — operator UX wins UX questions.
@@ -165,7 +165,7 @@ store). It is SERVER-SCOPED, not per-identity: it spawns from the
 _SERVER_SCOPE guard), NOT from any buddy's context.plugins.conversational_memory
 block. The per-identity spawn walk still discovers `background` here (conv_mem is
 context-homed), but start_background returns None for those calls — only the one
-server-scope call spawns. See ind-v4-brainstorm.md + the enrichment section below."""
+server-scope call spawns. See the V4 design spec + the enrichment section below."""
 
 
 # ---------------------------------------------------------------------------

@@ -12,7 +12,7 @@ This is the V4 port of the V1→V3 plugin that started the whole project. AIs ne
 
 ## V4 vs V3 differences
 
-- **Single config block.** V3 declared once at `role.context.plugins`. V4 also declares once at `*.context.plugins` — both `context_modify` (recall) and `post_response` (store) read the same config dict. Per the spec note in `ind-v4-brainstorm.md`, `post_response` is permitted in context slots when paired with `context_modify` as one logical knob set.
+- **Single config block.** V3 declared once at `role.context.plugins`. V4 also declares once at `*.context.plugins` — both `context_modify` (recall) and `post_response` (store) read the same config dict. Per the V4 design spec, `post_response` is permitted in context slots when paired with `context_modify` as one logical knob set.
 - **Async-native.** V4's `modify_context` and `observe_response` are `async def`; the executor schedules `observe_response` fire-and-forget after delivery. V3's `_run_async` thread-spawn / `_bg_pool` ThreadPoolExecutor / `_run_async_background` callback chain are all gone.
 - **Lazy resource resolution.** V3 cached the memory-MCP endpoint at `server.startup`. V4 has no `server.startup` capability — first call resolves and caches per-resource-key.
 - **`<user>` attribution from `ctx.identity`.** V3 preferred `bridge_sign.verified_caller` plugin_data over `ctx.identity`. V4 reads `ctx.identity` directly. Multi-hop attribution will land when bridge_message ports.

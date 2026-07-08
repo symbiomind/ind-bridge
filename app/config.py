@@ -27,8 +27,8 @@ V4 design decisions vs V3 (`mind-span-ce`)
   errors, structural issues) logs at appropriate levels and leaves the
   bridge in a degraded-but-running state. ``/health`` always works.
 
-See ``CLAUDE.md`` for the architecture cheat-sheet, and
-``~/Documents/ind-v4-brainstorm.md`` for the full spec.
+See ``CLAUDE.md`` for the architecture cheat-sheet and the project's
+V4 design docs for the full spec.
 """
 
 import logging

@@ -44,8 +44,8 @@ Toggles (env vars, cached at module load — restart to change):
     BRIDGE_DEV_TRACE_DIR=<path>         override log root (default: <repo>/logs/trace)
     BRIDGE_DEV_TRACE_REDACT_TOKENS=1    redact "Authorization: Bearer ..." (default on)
 
-See ``CLAUDE.md`` for the architecture cheat-sheet and
-``~/Documents/ind-v4-brainstorm.md`` for V4 spec context.
+See ``CLAUDE.md`` for the architecture cheat-sheet and the project's
+V4 design docs for spec context.
 """
 
 from __future__ import annotations
