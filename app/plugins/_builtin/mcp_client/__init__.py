@@ -704,10 +704,57 @@ async def _call_tool(conn: dict, raw_tool_name: str, args: dict):
             return await session.call_tool(raw_tool_name, arguments=args)
 
 
+# A single tool result must never dump an unbounded blob into the model's
+# context. A too-large result (a long log, a whole file) bloats every subsequent
+# turn (it's stored in history) and can stall a turn outright. Cap generously so
+# genuine long text survives, but truncate past it with an honest marker.
+_MAX_RESULT_CHARS = 24_000
+
+# Below this fraction of printable characters, a "text" payload is really binary
+# (e.g. a PNG read via read_text_file → decoded bytes like `�PNG…`). Feeding raw
+# binary as text has been observed to stall a live turn — the model chokes on the
+# garbage blob. We replace it with a safe placeholder instead.
+_MIN_PRINTABLE_RATIO = 0.70
+
+
+def _looks_binary(text: str) -> bool:
+    """True if ``text`` is mostly non-printable — a decoded binary file, not real
+    text. Samples the head (cheap; binary is uniform, no need to scan megabytes).
+    A short pure-text string is never binary."""
+    sample = text[:2000]
+    if not sample:
+        return False
+    printable = sum(1 for c in sample if c.isprintable() or c in "\n\r\t ")
+    return (printable / len(sample)) < _MIN_PRINTABLE_RATIO
+
+
+def _sanitize_result_text(text: str) -> str:
+    """Guard a tool-result string before it reaches the model: replace binary
+    blobs with a placeholder, and cap length so one result can't bloat context or
+    stall a turn. Real text passes through unchanged (under the cap)."""
+    if _looks_binary(text):
+        return (
+            "[mcp_client: tool returned binary/non-text data "
+            f"(~{len(text)} bytes), not shown. If you need to view an image, use a "
+            "vision/image tool — a text read of binary data is not usable.]"
+        )
+    if len(text) > _MAX_RESULT_CHARS:
+        return (
+            text[:_MAX_RESULT_CHARS]
+            + f"\n\n[mcp_client: result truncated — {len(text)} chars total, "
+            f"showing first {_MAX_RESULT_CHARS}.]"
+        )
+    return text
+
+
 def _stringify(result) -> str:
     """Extract text content from an MCP CallToolResult and hand it to the agent
     as the tool-result string. Unlike conv_mem (which json.loads to consume
-    structured fields), we pass the raw text through — the agent reads it."""
+    structured fields), we pass the raw text through — the agent reads it.
+
+    Guarded by _sanitize_result_text: binary blobs (a PNG read as text) become a
+    placeholder and oversized results are capped, so a single tool result can
+    never bloat the model's context or stall a turn with a garbage payload."""
     try:
         parts = []
         for item in getattr(result, "content", None) or []:
@@ -715,7 +762,7 @@ def _stringify(result) -> str:
             if text:
                 parts.append(text)
         if parts:
-            return "\n".join(parts)
+            return _sanitize_result_text("\n".join(parts))
     except Exception as e:
         logger.warning(f"mcp_client: result parse failed — {e}")
     return "[mcp_client: tool returned no text content]"

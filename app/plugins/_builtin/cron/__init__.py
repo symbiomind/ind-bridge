@@ -131,7 +131,14 @@ def start_background(ctx: "StartupCtx", config: dict):
 
 def _build_job(identity_key: str, job_name: str, job_cfg, identity_tz: str) -> dict | None:
     """Validate one named job's config into a runnable job dict, or None (warn +
-    skip) if it's malformed. Reads ``prompt_file`` from disk ONCE here."""
+    skip) if it's malformed.
+
+    Prompt FILES are NOT read here — the job stores its prompt *spec* and the
+    authoritative read happens at fire time (``_resolve_prompt`` in ``_fire``),
+    mirroring how ``system_prompt`` re-reads per request. This is what makes an
+    edit to a cron prompt file (dream fuel, HEARTBEAT.md) go live on the next
+    fire with no bridge restart. We still validate the prompt spec loudly here
+    (``validate_only=True``) so a structurally-broken job fails at startup."""
     if not isinstance(job_cfg, dict):
         logger.warning(
             f"cron: identity '{identity_key}' job '{job_name}' is not a mapping — skipped."
@@ -164,8 +171,9 @@ def _build_job(identity_key: str, job_name: str, job_cfg, identity_tz: str) -> d
         )
         return None
 
-    prompt = _resolve_prompt(identity_key, job_name, job_cfg)
-    if prompt is None:
+    # Validate the prompt spec at boot (fail loud), but DON'T persist a resolved
+    # string — file contents are read fresh at fire time from job_cfg.
+    if _resolve_prompt(identity_key, job_name, job_cfg, validate_only=True) is None:
         return None  # already warned
 
     tz_name = job_cfg.get("timezone") or identity_tz or "UTC"
@@ -194,14 +202,20 @@ def _build_job(identity_key: str, job_name: str, job_cfg, identity_tz: str) -> d
         "name": job_name,
         "cron_expr": cron_expr,
         "tz": tz_name,
-        "prompt": prompt,
+        # The raw prompt spec — resolved (files read fresh) at fire time.
+        "prompt_cfg": job_cfg,
         "model": job_cfg.get("model") or None,
         "additional": job_additional or {},
     }
 
 
-def _resolve_prompt(identity_key: str, job_name: str, job_cfg: dict) -> str | None:
-    """Resolve the job's prompt, read once at startup. Priority:
+_VALID = "\x00cron-prompt-valid\x00"  # sentinel: spec is structurally usable (validate_only)
+
+
+def _resolve_prompt(
+    identity_key: str, job_name: str, job_cfg: dict, *, validate_only: bool = False
+) -> str | None:
+    """Resolve the job's prompt. Priority:
 
       1. ``prompt:`` — an ORDERED list of ``{file|text}`` parts, assembled
          top-to-bottom (same shape as the system_prompt plugin; shares
@@ -209,7 +223,17 @@ def _resolve_prompt(identity_key: str, job_name: str, job_cfg: dict) -> str | No
       2. ``prompt_text`` — a single inline string (shorthand).
       3. ``prompt_file`` — a single file path (shorthand).
 
-    Warn+None if nothing usable is present (DLC-grace: the job is skipped)."""
+    Files are read FRESH on every call (via ``app.prompt_parts`` / ``open``), so
+    calling this at fire time picks up edits with no bridge restart.
+
+    ``validate_only=True`` is the boot-time guard: it checks the spec is
+    structurally usable (a valid key is present; a ``prompt:`` is a list) and
+    returns the ``_VALID`` sentinel, WITHOUT reading files or persisting text —
+    boot must not bake file contents. A structurally-broken spec still warns and
+    returns None so the job is skipped at startup.
+
+    Warn+None if nothing usable is present (DLC-grace: the job is skipped, or —
+    at fire time — the fire is skipped)."""
     prompt_list = job_cfg.get("prompt")
     if prompt_list is not None:
         if not isinstance(prompt_list, list):
@@ -218,6 +242,9 @@ def _resolve_prompt(identity_key: str, job_name: str, job_cfg: dict) -> str | No
                 f"list of {{file|text}} parts — got {type(prompt_list).__name__}; skipped."
             )
             return None
+        if validate_only:
+            # Structure is fine; defer the file read to fire time.
+            return _VALID
         from app import prompt_parts
         assembled = prompt_parts.load_items(
             prompt_list, source=f"cron[{identity_key}/{job_name}]"
@@ -239,9 +266,13 @@ def _resolve_prompt(identity_key: str, job_name: str, job_cfg: dict) -> str | No
             f"and prompt_file — using prompt_text. (Use a 'prompt:' list to stack both.)"
         )
     if prompt_text:
-        return str(prompt_text)
+        return _VALID if validate_only else str(prompt_text)
 
     if prompt_file:
+        if validate_only:
+            # Presence of the key is enough at boot; the file is read at fire time
+            # (a missing/empty file then warns and skips that single fire).
+            return _VALID
         try:
             with open(prompt_file, "r", encoding="utf-8") as fh:
                 content = fh.read().strip()
@@ -327,11 +358,25 @@ async def _job_loop(identity_key: str, job: dict) -> None:
 
 async def _fire(identity_key: str, job: dict) -> None:
     """Synthesise a minimal request and drive it through the identity's pipeline.
-    The response is DISCARDED — basic_session has already persisted the turn."""
+    The response is DISCARDED — basic_session has already persisted the turn.
+
+    The prompt is resolved HERE, at fire time — files are read fresh — so an
+    edit to a cron prompt file (dream fuel, HEARTBEAT.md) takes effect on the
+    next fire with no bridge restart. If the prompt resolves empty now (e.g. the
+    file was deleted or emptied mid-day), skip this fire gracefully rather than
+    send an empty turn; the loop lives on for the next tick."""
     from app import pipeline_executor
 
+    prompt = _resolve_prompt(identity_key, job["name"], job["prompt_cfg"])
+    if not prompt:
+        logger.warning(
+            f"cron: job '{job['name']}' (identity '{identity_key}') prompt resolved "
+            f"empty at fire time — skipping this fire (loop continues)."
+        )
+        return
+
     body = {
-        "messages": [{"role": "user", "content": job["prompt"]}],
+        "messages": [{"role": "user", "content": prompt}],
         "stream": False,
         "tools": [],
     }

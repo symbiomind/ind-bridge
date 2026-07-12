@@ -43,7 +43,15 @@ This plugin lives WHOLLY in one ``sessions.<name>.plugins`` block (D-010 lets
       my_session:
         plugins:
           basic_session:
-            max_turns: 20                    # SEND window; false/0 = send all. Storage is always full.
+            max_turns: 20                    # SEND window in PAIRS; false/0 = send all. Storage always full.
+            send_window: "36h"               # optional TIME-based SEND window ("36h"/"2d"/"90m";
+                                             #   off unless set). Forwards only turns from the last
+                                             #   N; older ones (and any pre-feature turn with no
+                                             #   `ts`) drop off the WIRE, stay on disk. Composes with
+                                             #   max_turns — TIGHTEST wins. Turns get a save-time `ts`
+                                             #   (bridge-internal, stripped before upstream). Ideal for
+                                             #   a CONTINUOUS buddy (session_reset: never) — a rolling
+                                             #   horizon instead of a daily wipe.
             data_dir: data/basic_session     # parent dir (default as shown); each
                                              # session is stored under its own subfolder:
                                              # <data_dir>/<session_key>/<session_key>.json
@@ -107,6 +115,7 @@ import json
 import logging
 import os
 import re
+import time
 from datetime import datetime, time as dt_time, timedelta
 from typing import TYPE_CHECKING
 
@@ -124,7 +133,53 @@ CAPABILITIES = {
 
 
 _DEFAULT_MAX_TURNS = 20
+_DEFAULT_SEND_WINDOW = None  # time-based send window OFF unless a session opts in
 _DEFAULT_DATA_DIR = "data/basic_session"
+
+# ---------------------------------------------------------------------------
+# Per-session-file save lock (concurrency safety — step 1 of the session queue).
+#
+# The session file is shared BY DESIGN (D-006: sessions are top-level named
+# blocks referenced by name; multiple identities/harnesses point at one file).
+# So one session file has THREE concurrent writers on the single event loop:
+#   * HTTP harness turns (OpenAI-Protocol listener),
+#   * cron heartbeats (cron._fire → execute()),
+#   * bridge_messaging deliveries (_handle_send → execute() on the recipient).
+# All three funnel through observe_response, whose load→append→save is a
+# non-atomic read-modify-write. Interleaved at any await point → last-writer-wins
+# clobber = LOST TURNS — several callers talking over one agent at once.
+#
+# Fix: serialize the save per RESOLVED SESSION FILE PATH — NOT per identity or
+# per session-name, because partitions + bridge_messaging's caller override can
+# route the same carrier to DIFFERENT partition files (_partition_suffix); the
+# file path is the true contention unit, and keying on it avoids over-serializing
+# unrelated partitions/sessions. Locks are created lazily (double-checked under
+# _lock_registry_lock) so each asyncio.Lock is bound to the running loop, never
+# at import (conv_mem's _resource_cache style). This is the NARROW seam: it
+# guards only the save's read-modify-write, so concurrent LLM calls to one
+# session are NOT throttled — only the disk write is serialized.
+# ---------------------------------------------------------------------------
+_save_locks: dict[str, asyncio.Lock] = {}
+_lock_registry_lock = asyncio.Lock()  # guards the create-check of _save_locks
+
+
+async def _get_save_lock(session_file: str) -> asyncio.Lock:
+    """Return the per-file save lock, lazily creating it (double-checked) so the
+    ``asyncio.Lock`` is bound to the running event loop, not import time."""
+    lock = _save_locks.get(session_file)
+    if lock is None:
+        async with _lock_registry_lock:
+            lock = _save_locks.get(session_file)
+            if lock is None:
+                lock = asyncio.Lock()
+                _save_locks[session_file] = lock
+    return lock
+
+# Bridge-internal per-turn field: Unix epoch stamped on SAVE. NOT part of the
+# OpenAI protocol — stripped before the upstream call so it never reaches a
+# provider. It's a REUSABLE primitive (the time-based send window is its first
+# consumer, not its owner): future time-aware features read the same field.
+_TS_KEY = "ts"
 
 # Header the harness can send to force a manual reset (session_reset.mode: manual).
 _MANUAL_RESET_HEADER = "x-session-reset"
@@ -177,9 +232,26 @@ def apply_outbound_params(ctx: "PipelineCtx", config: dict) -> "PipelineCtx":
     system_content = _build_system_prompt(upstream_system, config)
 
     # The send window trims what we forward upstream — NOT the stored file.
-    # Tool-group-safe so windowing never orphans a tool message from its parent.
+    # Two composable windows, TIGHTEST WINS (both are just successive trims):
+    #   1. time  — drop turns older than `send_window` (or with no `ts`).
+    #   2. count — keep the last `max_turns` pairs.
+    # Both stay tool-group-safe so windowing never orphans a tool message from
+    # its parent (a leading orphan `tool` = a strict-provider 400).
+    send_window = _resolve_send_window(config)
+    sent_history = _time_window(history, send_window)
     max_messages = None if max_turns is None else max_turns * 2
-    sent_history = _tool_group_safe_window(history, max_messages)
+    sent_history = _tool_group_safe_window(sent_history, max_messages)
+
+    # WIRE-SAFETY: never send a content-less, tool_call-less assistant turn. A
+    # strict provider (Moonshot) 400s: "the message at position N with role
+    # 'assistant' must not be empty". Such turns EXIST on disk on purpose — the
+    # save-loss fix persists the empty final lap so the tool exchange around it
+    # survives (a Moonshot quirk: it sometimes closes a tool-follow-up lap with
+    # nothing at all). Storage keeps them (they hold the turn's place in the
+    # lab-notebook); the WIRE must not carry them. Same "full storage, filtered
+    # wire" rule as the windows above. An assistant turn WITH tool_calls but empty
+    # content is LEGITIMATE (a bare tool call) and is kept.
+    sent_history = _drop_empty_assistant_turns(sent_history)
 
     # Optional: fold OLD tool exchanges to assistant prose on the wire (storage
     # untouched). Keeps the most-recent closed exchange raw so the agent can
@@ -229,7 +301,10 @@ def apply_outbound_params(ctx: "PipelineCtx", config: dict) -> "PipelineCtx":
             f"(clean pipe; no stored-history substitution)"
         )
     else:
-        new_messages.extend(sent_history)
+        # Strip the bridge-internal `ts` so it never rides upstream to a provider
+        # (only stored turns carry it; inbound/latest_user come clean from the
+        # harness). Storage keeps `ts`; the wire does not.
+        new_messages.extend(_strip_ts(sent_history))
         # SEND path: preserve multi-part content (image_url etc.) verbatim so the
         # model actually receives the image. (Storage still flattens — line ~312.)
         latest_user = _extract_latest_user_message(inbound, flatten=False)
@@ -254,33 +329,90 @@ def apply_outbound_params(ctx: "PipelineCtx", config: dict) -> "PipelineCtx":
 # post_response — append the closed turn to the stored history (after delivery)
 # ---------------------------------------------------------------------------
 
-def observe_response(ctx: "PipelineCtx", config: dict) -> None:
+async def observe_response(ctx: "PipelineCtx", config: dict) -> None:
     """Append the closed turn to the stored history. Fires fire-and-forget
     after the response has shipped (D-007 observer); sees only the final,
     closed assistant turn. Stores *rich* assistant fields (reasoning /
     tool_calls) so replay survives picky providers. When a harness tool-loop
     closes, stores the FULL exchange (user + tool turns + final text) so the
-    agent's memory records that it actually ran the tool."""
+    agent's memory records that it actually ran the tool.
+
+    ASYNC + LOCKED: the load→append→save below is serialized per session FILE
+    (``_get_save_lock``) so concurrent writers to one shared session (HTTP turn +
+    cron heartbeat + bridge_messaging delivery) can't clobber each other's turns
+    (last-writer-wins → lost history). The lock spans the whole read-modify-write
+    — the load must be inside it too, or a flow that loaded before another saved
+    would still append onto a stale base and overwrite. Narrow seam: only the
+    save is serialized; the upstream LLM call already ran, so callers aren't
+    throttled. ``_run_observer`` already awaits coroutine observers, so no
+    executor change is needed."""
     session_file = ctx.plugin_data.get("basic_session.file")
     session_key = ctx.plugin_data.get("basic_session.key", "?")
     if not session_file:
         return  # apply_outbound_params didn't run (or session not wired) — nothing to save.
 
+    # Did a BRIDGE-OWNED tool loop already run and CLOSE this turn? Only the
+    # bridge-owned breadcrumb (intercept.loop_ran) means "the bridge ran the loop
+    # and there is NO further lap coming to save it" — so we MUST persist now,
+    # even if the final assistant turn is empty or (edge case) still carries
+    # tool_calls. This is the streaming-intercept save-loss fix: that path can
+    # close after the tool executed but before a clean text lap lands, leaving
+    # ctx.response None or tool_call-bearing → the guards below would skip and the
+    # whole turn (the call + result) would VANISH (e.g. an output:async
+    # bridge_messaging_send turn — proven 2026-07-11).
+    #
+    # NOT in_tool_loop: that's HARNESS-owned — the harness runs the loop and WILL
+    # re-hit the bridge with the next lap, so skipping a mid-harness-loop turn
+    # that still carries tool_calls is correct (a later lap saves it). Conflating
+    # the two would wrongly persist a mid-harness-loop turn twice.
+    bridge_loop_closed = bool(ctx.plugin_data.get("intercept.loop_ran"))
+
     assistant_turn = _build_rich_assistant_turn(ctx.response)
     if assistant_turn is None:
-        return
+        if bridge_loop_closed:
+            # Loop ran but produced no final text turn (stream closed after the
+            # tool). Persist the exchange with a placeholder final turn so the
+            # tool call + result are not lost.
+            assistant_turn = {"role": "assistant", "content": ""}
+        else:
+            return
 
     # Loop-not-closed guard: an assistant turn still carrying tool_calls means
-    # the agent wants a tool, not to talk. Whether the loop is harness-owned
-    # (in_tool_loop set at load) or bridge-owned (executor intercept), skip the
-    # save — the next lap comes back through and we save when it closes with text.
+    # the agent wants a tool, not to talk. Skip the save ONLY when the loop has
+    # NOT already run — then the next lap comes back through and we save when it
+    # closes with text. If the loop ALREADY ran (breadcrumb set), we persist now
+    # (stripping the trailing tool_calls off the final turn — the exchange is
+    # stored from the working-copy tail, not this dangling call).
     if assistant_turn.get("tool_calls"):
-        logger.info(
-            f"basic_session: '{session_key}' — assistant turn carries tool_calls, "
-            f"skipping save (waiting for loop to close)"
-        )
-        return
+        if bridge_loop_closed:
+            assistant_turn = {
+                k: v for k, v in assistant_turn.items() if k != "tool_calls"
+            }
+            if not assistant_turn.get("content"):
+                assistant_turn["content"] = ""
+        else:
+            logger.info(
+                f"basic_session: '{session_key}' — assistant turn carries tool_calls, "
+                f"skipping save (waiting for loop to close)"
+            )
+            return
 
+    # Serialize the read-modify-write per session FILE so concurrent writers
+    # (HTTP turn + cron heartbeat + bridge_messaging delivery all sharing one
+    # session) can't clobber each other. The load is INSIDE the lock on purpose:
+    # a flow that loaded before another saved would otherwise append onto a stale
+    # base and overwrite the other's turn. See _get_save_lock.
+    lock = await _get_save_lock(session_file)
+    async with lock:
+        _append_closed_turn(ctx, session_file, session_key, assistant_turn)
+
+
+def _append_closed_turn(
+    ctx: "PipelineCtx", session_file: str, session_key: str, assistant_turn: dict
+) -> None:
+    """Load history, append the closed turn (plain pair OR full tool-loop
+    exchange), and save. MUST run under the per-file save lock (called only from
+    observe_response) — it is a read-modify-write on the shared session file."""
     # We store the WORKING-copy user turn — i.e. WITH the bridge_context the
     # bridge injected this turn (caller + that turn's recalled memories). This is
     # what the agent actually saw, so replaying it is the agent's faithful memory.
@@ -318,6 +450,12 @@ def observe_response(ctx: "PipelineCtx", config: dict) -> None:
         loop_messages = _loop_exchange_to_store(ctx.request.messages)
         if not loop_messages:
             return
+        # Stamp the whole exchange with one save-time `ts` (a tool-loop is one
+        # moment). Existing turns already in `history` keep their own stamp.
+        now = int(time.time())
+        for turn in loop_messages:
+            _stamp(turn, now)
+        _stamp(assistant_turn, now)
         history.extend(loop_messages)
         history.append(assistant_turn)
         _save_history(session_file, history)
@@ -333,6 +471,11 @@ def observe_response(ctx: "PipelineCtx", config: dict) -> None:
     user_turn = _extract_latest_user_message(ctx.request.messages)
     if user_turn is None:
         return
+    # Stamp the pair with one save-time `ts` (a REUSABLE per-turn primitive;
+    # the send window reads it, but it's not window-only).
+    now = int(time.time())
+    _stamp(user_turn, now)
+    _stamp(assistant_turn, now)
     history.append(user_turn)
     history.append(assistant_turn)
     # Storage is always full — no trim on save.
@@ -732,6 +875,35 @@ def _resolve_max_turns(config: dict) -> int | None:
     return int(raw)
 
 
+_DURATION_UNITS = {"m": 60, "h": 3600, "d": 86400}  # minutes / hours / days
+
+
+def _parse_duration(raw) -> float | None:
+    """Parse a duration string like ``"36h"`` / ``"2d"`` / ``"90m"`` / ``"0.5h"``
+    into SECONDS. Returns None (no window) for a falsy/unset value, and
+    warn+None for a malformed one (fail-loud-not-fail — a typo disables the
+    window rather than crashing the session)."""
+    if raw is None or raw is False or raw == "":
+        return None
+    s = str(raw).strip().lower()
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)\s*([mhd])", s)
+    if not m:
+        logger.warning(
+            f"basic_session: send_window '{raw}' is not a valid duration "
+            f"(expected e.g. '36h', '2d', '90m') — no time window applied."
+        )
+        return None
+    value, unit = float(m.group(1)), m.group(2)
+    return value * _DURATION_UNITS[unit]
+
+
+def _resolve_send_window(config: dict) -> float | None:
+    """The time-based SEND window in SECONDS (None == off). Turns older than
+    ``now - seconds`` (or with no ``ts``) drop off the wire. Storage is
+    unaffected. Composes with ``max_turns`` — tightest wins."""
+    return _parse_duration(config.get("send_window", _DEFAULT_SEND_WINDOW))
+
+
 # ---------------------------------------------------------------------------
 # History I/O (lifted from V3)
 # ---------------------------------------------------------------------------
@@ -750,11 +922,48 @@ def _load_history(path: str) -> list[dict]:
 
 
 def _save_history(path: str, history: list[dict]) -> None:
+    """Atomically persist history: write a temp file beside the target, then
+    ``os.replace`` it into place. os.replace is atomic on POSIX, so a reader
+    (``_load_history``) never sees a half-written file — which would parse-fail
+    and be silently swallowed as an EMPTY session (catastrophic: the whole
+    conversation reads as gone). Belt-and-suspenders alongside the per-file save
+    lock: the lock serializes bridge-internal writers, the atomic rename also
+    guards a reader mid-write and any writer that crashes partway."""
+    tmp_path = f"{path}.tmp.{os.getpid()}"
     try:
-        with open(path, "w", encoding="utf-8") as f:
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(history, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, path)
     except Exception as e:
         logger.error(f"basic_session: could not save '{path}' — {e}")
+        # Don't leave a stray temp file behind on failure.
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+
+
+def _stamp(turn: dict, now: int | None = None) -> dict:
+    """Stamp a turn dict with the bridge-internal ``ts`` (Unix epoch) on SAVE,
+    unless it already carries one. Idempotent and mutate-in-place (returns the
+    same dict for chaining). A REUSABLE primitive — the send window is its first
+    reader; keep it general, don't couple it to windowing."""
+    if isinstance(turn, dict) and _TS_KEY not in turn:
+        turn[_TS_KEY] = int(time.time()) if now is None else now
+    return turn
+
+
+def _strip_ts(messages: list[dict]) -> list[dict]:
+    """Return copies of ``messages`` with the bridge-internal ``ts`` removed, so
+    the field never rides upstream to a provider. Only copies dicts that carry
+    ``ts`` (untouched ones pass through by reference — cheap)."""
+    out: list[dict] = []
+    for m in messages:
+        if isinstance(m, dict) and _TS_KEY in m:
+            m = {k: v for k, v in m.items() if k != _TS_KEY}
+        out.append(m)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -899,6 +1108,71 @@ def _tool_group_safe_window(history: list[dict], max_messages: int) -> list[dict
     start = len(history) - max_messages
     # Back the boundary up over any leading orphan tool messages, then over the
     # assistant(tool_calls) parent that precedes them.
+    while start > 0 and history[start].get("role") == "tool":
+        start -= 1
+    return history[start:]
+
+
+def _drop_empty_assistant_turns(messages: list[dict]) -> list[dict]:
+    """Drop assistant turns that carry NEITHER content NOR tool_calls — the WIRE
+    can't take them (Moonshot 400: "the message at position N with role
+    'assistant' must not be empty"). Wire-only: storage keeps them.
+
+    WHY THEY EXIST ON DISK: the streaming save-loss fix persists a turn whose
+    bridge-owned tool loop closed without a final text lap (a Moonshot quirk — it
+    sometimes returns a completely empty close-out lap after a tool result). We
+    store an empty placeholder so the tool call + result around it are NOT lost.
+    That's right for the lab-notebook; it's poison on the wire.
+
+    TOOL-GROUP SAFE BY CONSTRUCTION: an assistant turn WITH ``tool_calls`` is
+    KEPT (a bare tool call with empty content is legitimate and is the parent of
+    the ``tool`` messages that follow). We only drop turns with no tool_calls, and
+    those never have tool children — so dropping one can never orphan a ``tool``
+    message. Reasoning-only turns (content empty but reasoning present) are also
+    dropped from the wire: the provider still sees an empty assistant message."""
+    out: list[dict] = []
+    for m in messages:
+        if (
+            isinstance(m, dict)
+            and m.get("role") == "assistant"
+            and not m.get("tool_calls")
+        ):
+            content = m.get("content")
+            if content is None or (isinstance(content, str) and not content.strip()):
+                continue  # empty + no tool_calls → never goes upstream
+        out.append(m)
+    return out
+
+
+def _time_window(history: list[dict], seconds: float | None) -> list[dict]:
+    """Drop turns older than ``now - seconds`` from the SEND view (storage
+    untouched). ``seconds is None`` → no time window (pass through).
+
+    UN-STAMPED = OLD: a turn with no ``ts`` is by definition pre-feature, so it
+    falls OUTSIDE any window — the absence of a timestamp is the back-compat
+    signal (no migration needed). When a session first gets a ``send_window``,
+    its existing un-stamped turns drop off the wire (still on disk) and the
+    window rebuilds rolling as new stamped turns land.
+
+    Tool-group-safe: after the age cut, if the first kept message is a ``tool``,
+    walk the boundary back to include its parent ``assistant(tool_calls)`` (same
+    invariant as ``_tool_group_safe_window``) so a strict provider never 400s on
+    a leading orphan tool result."""
+    if seconds is None or not history:
+        return history
+    cutoff = time.time() - seconds
+    # First index that is IN-window (stamped and fresh enough). Scan from the
+    # front; everything before `start` is old/un-stamped and drops.
+    start = 0
+    while start < len(history):
+        ts = history[start].get(_TS_KEY)
+        if isinstance(ts, (int, float)) and ts >= cutoff:
+            break
+        start += 1
+    if start >= len(history):
+        return []  # nothing fresh enough
+    # Don't leave a leading orphan `tool`: back up over any tool messages and
+    # their parent assistant(tool_calls) so the kept slice stays well-formed.
     while start > 0 and history[start].get("role") == "tool":
         start -= 1
     return history[start:]

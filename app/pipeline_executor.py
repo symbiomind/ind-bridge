@@ -55,6 +55,106 @@ from .context import (
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Per-session TURN queue (session-serialisation — step 2 of the session queue).
+#
+# A session is shared BY DESIGN (D-006): a human harness turn, a cron heartbeat,
+# and an incoming bridge_messaging delivery can all target ONE session. Each is a
+# WHOLE execute() turn — an LLM inference + tool loop + a save. The per-file SAVE
+# lock (basic_session._get_save_lock) stops two saves clobbering, but does NOT
+# stop two turns INFERRING concurrently on one session: two models thinking into
+# one conversation, each blind to the other, racing at the write. cron's own
+# docstring has flagged this ("until session-serialisation lands…").
+#
+# Fix: serialise whole TURNS per session. A turn acquires its session's line at
+# execute() entry and holds it until its own SAVE completes, so the NEXT turn
+# loads a history that already contains the previous turn (the bartender model:
+# one buddy, one mouth, customers served one at a time in arrival order). This is
+# semantically correct, not just safe — you don't want a buddy half-answering two
+# callers at once.
+#
+# Key = the SESSION (two identities can share one session — e.g. an agent's
+# `*_frontend` and `*_harness_b` identities pointing at one role → one file, so
+# keying on identity would let them run concurrently into the shared session).
+# Session-less pipelines (stateless: audit/metrics) key
+# on identity_key so they still serialise per-identity but never block a peer.
+# Locks are lazily created (double-checked) so each asyncio.Lock binds to the
+# running loop — same pattern as basic_session._get_save_lock.
+# ---------------------------------------------------------------------------
+_turn_locks: dict[str, asyncio.Lock] = {}
+_turn_lock_registry_lock = asyncio.Lock()
+
+# How long a turn will WAIT for a busy session's line before giving up and
+# proceeding without serialisation (fail-open — a hung neighbour never wedges the
+# queue forever). Must exceed a legitimate slow turn (big tool loops run 30s–2min)
+# so normal heavy turns still serialise; a turn still holding the line past this
+# is genuinely hung. Matches the upstream call ceiling (OUTBOUND_TIMEOUT ~300s).
+_TURN_LOCK_TIMEOUT = float(os.getenv("BRIDGE_TURN_LOCK_TIMEOUT", "300"))
+
+
+async def _get_turn_lock(session_or_identity_key: str) -> asyncio.Lock:
+    """Return the per-session (or per-identity, session-less) turn lock, lazily
+    creating it under a registry guard so the ``asyncio.Lock`` binds to the
+    running event loop."""
+    lock = _turn_locks.get(session_or_identity_key)
+    if lock is None:
+        async with _turn_lock_registry_lock:
+            lock = _turn_locks.get(session_or_identity_key)
+            if lock is None:
+                lock = asyncio.Lock()
+                _turn_locks[session_or_identity_key] = lock
+    return lock
+
+
+def _wrap_streaming_release(response: StreamingResponse, release) -> None:
+    """Hold the session turn line until a streaming response's turn is fully
+    complete — INCLUDING its save — then release it.
+
+    A ``StreamingResponse`` returns to the client immediately; the body drains
+    afterward, and the post_response SAVE runs LATER still, via one of two
+    mechanisms depending on the path:
+      * pass-through stream — a starlette ``BackgroundTask`` (``response.background``)
+        that starlette runs AFTER the body_iterator is exhausted;
+      * streaming-intercept — an ``on_complete`` coroutine fired inside the
+        generator's own ``finally`` (so it completes as the iterator drains).
+
+    Releasing on iterator-drain alone would free the line BEFORE the
+    BackgroundTask save on the pass-through path — the exact race we're closing
+    (the next queued turn could load a history missing this turn). So we release
+    AFTER the save on BOTH paths:
+      * if a BackgroundTask is present, chain release to run right after it (the
+        save is the task's whole body → release strictly follows the save);
+      * otherwise (intercept path saves inside the generator), release in the
+        drained iterator's finally — by which point on_complete has run.
+    Belt-and-braces: whichever hook exists, the line is held past the save."""
+    existing_bg = getattr(response, "background", None)
+
+    if existing_bg is not None:
+        # Pass-through path: the save IS the BackgroundTask body. Run it, then
+        # release — strictly ordered, and release fires even if the task raises.
+        async def _save_then_release():
+            try:
+                await existing_bg()
+            finally:
+                release()
+        response.background = BackgroundTask(_save_then_release)
+        return
+
+    # Intercept path (or no observers): the save (if any) rides inside the
+    # generator's on_complete/finally. Release once the iterator is fully
+    # drained — on_complete has run by then — and on client disconnect too.
+    inner = response.body_iterator
+
+    async def _draining_iter():
+        try:
+            async for chunk in inner:
+                yield chunk
+        finally:
+            release()
+
+    response.body_iterator = _draining_iter()
+
+
 # Slot family classification ---------------------------------------------------
 
 _INBOUND_CONTEXT_SLOTS = frozenset({
@@ -124,6 +224,81 @@ def _has_response_modify(pipeline: list) -> bool:
 async def execute(
     identity_key: str, raw_body: dict, headers: dict[str, str]
 ) -> "dict | StreamingResponse":
+    """Serialise this turn behind any in-flight turn for the SAME session, then
+    run it. The turn queue (step 2 of the session queue) makes a shared session
+    serve one caller at a time in arrival order — a human harness turn, a cron
+    heartbeat, and an incoming bridge_messaging delivery all wait their turn on
+    the session line rather than inferring concurrently into one conversation.
+    See ``_get_turn_lock``.
+
+    The lock is held until this turn's SAVE completes, so the next queued turn
+    loads a history that already contains this one:
+      * non-streaming (cron / bridge_messaging / non-stream HTTP) — the body
+        awaits its own observers before returning, so 'returned == saved', then
+        the ``finally`` releases the line.
+      * streaming (LibreChat live) — ``_execute_locked`` returns a
+        StreamingResponse whose body (and trailing save hook) run AFTER it
+        returns; we wrap that generator so the line releases only when the stream
+        is fully drained (its after-stream observers have saved). Release is thus
+        tied to the response's real lifetime, never dropped early.
+    """
+    # Resolve the serialisation key WITHOUT building ctx yet (cheap config
+    # lookups): the session name if the role declares one, else the identity.
+    role_key = config.get_identity_role_key(identity_key) or ""
+    role_cfg = config.resolve_role(role_key) or {}
+    lock_key = role_cfg.get("session") or f"__identity__{identity_key}"
+
+    turn_lock = await _get_turn_lock(lock_key)
+    # Acquire with a TIMEOUT so a truly-hung turn (a wedged stream whose generator
+    # never drains → its _release never fires) can NEVER wedge a session's queue
+    # forever. If the line doesn't free within the window, we proceed WITHOUT the
+    # lock rather than block this turn indefinitely — degrading to the pre-step-2
+    # behaviour (possible save race) instead of a permanent freeze. Fail-open: a
+    # hung neighbour delays you at most _TURN_LOCK_TIMEOUT, never forever.
+    acquired = True
+    try:
+        await asyncio.wait_for(turn_lock.acquire(), timeout=_TURN_LOCK_TIMEOUT)
+    except asyncio.TimeoutError:
+        acquired = False
+        logger.warning(
+            f"pipeline_executor: turn lock '{lock_key}' not acquired within "
+            f"{_TURN_LOCK_TIMEOUT}s (a prior turn may be hung) — proceeding "
+            f"WITHOUT serialisation for identity '{identity_key}'. The per-file "
+            f"save lock still guards against a clobber."
+        )
+    released = False
+
+    def _release() -> None:
+        nonlocal released
+        # Only release a lock we actually hold: a timed-out acquire proceeded
+        # without it, so releasing would raise RuntimeError on an unlocked lock.
+        if acquired and not released:
+            released = True
+            turn_lock.release()
+
+    try:
+        result = await _execute_locked(identity_key, raw_body, headers)
+    except BaseException:
+        _release()
+        raise
+
+    if isinstance(result, StreamingResponse):
+        # Streaming: the body + its after-stream save run AFTER this returns.
+        # Hold the line until the stream is fully drained, then release. Wrap
+        # the response's iterator so release fires in its finally — even on
+        # client disconnect — and never earlier.
+        _wrap_streaming_release(result, _release)
+        return result
+
+    # Non-streaming: the body already awaited its save (see
+    # _dispatch_observers_nonstream, now awaited on this path). Safe to release.
+    _release()
+    return result
+
+
+async def _execute_locked(
+    identity_key: str, raw_body: dict, headers: dict[str, str]
+) -> "dict | StreamingResponse":
     """Run one request through ``identity_key``'s assembled pipeline.
 
     Returns either an OpenAI-shaped response dict (non-streaming, or
@@ -131,7 +306,8 @@ async def execute(
     (streaming pass-through to upstream). The listener plugin's route
     handler returns whatever this returns — FastAPI handles both cases.
 
-    On error, raises — listener plugins decide how to surface errors.
+    Called only from ``execute``, which holds the per-session turn lock around
+    it. On error, raises — listener plugins decide how to surface errors.
     """
     pipeline = pipeline_assembler.get_pipeline(identity_key)
     if pipeline is None:
@@ -407,11 +583,13 @@ async def execute(
                 tuple_index=index,
             )
 
-        # 9. post_response observers (D-007) — fire-and-forget background
-        #    dispatch on the running event loop. Observers see the assembled
-        #    assistant turn but don't delay the response. Exceptions logged
-        #    and swallowed inside _run_observer.
-        _dispatch_observers_nonstream(ctx, pipeline)
+        # 9. post_response observers (D-007) — AWAITED on the non-streaming path
+        #    so the turn's SAVE completes before execute() releases the per-session
+        #    turn lock (the next queued turn then loads a history containing this
+        #    one). Observers see the assembled assistant turn; exceptions are
+        #    logged and swallowed inside _run_observer, so a bad observer never
+        #    blocks the turn. Saves are ms-scale local writes — negligible latency.
+        await _dispatch_observers_nonstream(ctx, pipeline)
 
         # Final response: ctx.response was populated by produce_response or by
         # _do_http_call_nonstream. If still None, something went wrong.
@@ -561,6 +739,11 @@ def _build_ctx(identity_key: str, raw_body: dict, headers: dict[str, str]) -> Pi
         # the <bridge_context> envelope (not the <caller>), folded into the
         # signature by assemble_and_sign. Popped so it never reaches the provider.
         bridge_storage = raw_body.pop("_bridge_storage", None)
+        # Recall marker — mirror of storage. bridge_messaging sets "false" so the
+        # receiver's conversational_memory SKIPS recalling memories into this
+        # turn. Same envelope-attr + signed treatment as storage. Popped so it
+        # never reaches the provider.
+        bridge_recall = raw_body.pop("_bridge_recall", None)
         if isinstance(bridge_caller, str) and bridge_caller:
             name = bridge_caller          # synthetic caller overrides carrier name
         if isinstance(bridge_trust, str) and bridge_trust:
@@ -664,6 +847,9 @@ def _build_ctx(identity_key: str, raw_body: dict, headers: dict[str, str]) -> Pi
     # bridge, never from an external body claiming to be trusted.
     if isinstance(bridge_caller, str) and bridge_caller and isinstance(bridge_storage, str) and bridge_storage:
         ctx.bridge_context["_attr_storage"] = bridge_storage
+    # Recall marker — same sovereignty gate as storage.
+    if isinstance(bridge_caller, str) and bridge_caller and isinstance(bridge_recall, str) and bridge_recall:
+        ctx.bridge_context["_attr_recall"] = bridge_recall
     return ctx
 
 
@@ -1225,13 +1411,24 @@ async def _run_observer(plugin: Any, plugin_config: dict, ctx: PipelineCtx, slot
         )
 
 
-def _dispatch_observers_nonstream(ctx: PipelineCtx, pipeline: list) -> None:
-    """Schedule observer dispatches on the running event loop, then return
-    immediately so the response can ship to the client.
+async def _dispatch_observers_nonstream(ctx: PipelineCtx, pipeline: list) -> None:
+    """Run the non-streaming path's post_response observers and AWAIT them
+    before returning.
 
     Used on the non-streaming path. ctx.response is already populated by
     either produce_response or _do_http_call_nonstream, so observers see
-    the assembled assistant turn directly."""
+    the assembled assistant turn directly.
+
+    Why AWAITED (not the old fire-and-forget ``create_task``): the per-session
+    turn lock (see ``execute``) must be held until this turn's SAVE completes, so
+    the next queued turn on the same session loads a history that already
+    contains this turn. Awaiting the observers here makes 'the pipeline body
+    returned' mean 'the save is on disk'. The saves are local file writes
+    (basic_session) or fast memory stores (conversational_memory) — milliseconds,
+    not a network round-trip — and the client's bytes were already produced
+    upstream, so this adds negligible latency while closing the turn-order race.
+    Observer exceptions are still swallowed inside ``_run_observer`` — a failing
+    observer never blocks or breaks the turn."""
     observers = _collect_observer_tuples(pipeline)
     if not observers:
         return
@@ -1243,12 +1440,7 @@ def _dispatch_observers_nonstream(ctx: PipelineCtx, pipeline: list) -> None:
             observers=[_short_name(p) for _, p, _ in observers],
         )
     for slot, plugin, plugin_config in observers:
-        # asyncio.create_task fires the coroutine immediately on the
-        # current event loop. The request handler returns before these
-        # complete; FastAPI/uvicorn don't await them. Pure fire-and-forget.
-        asyncio.create_task(
-            _run_observer(plugin, plugin_config, ctx, slot)
-        )
+        await _run_observer(plugin, plugin_config, ctx, slot)
 
 
 async def _dispatch_observers_after_stream(

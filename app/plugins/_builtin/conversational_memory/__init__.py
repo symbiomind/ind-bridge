@@ -230,10 +230,26 @@ _TASK_LABEL_ENRICHMENT = "label_enrichment"
 """The task name a worker role lists in conversational_memory.tasks to opt into
 being the label-enrichment worker."""
 
-# Per-store nudge flags — set True by observe_response after a successful store so
-# the matching catch-up loop wakes immediately instead of waiting for its poll.
-# Keyed by memory-store resource_key.
-_enrich_nudge: dict[str, bool] = {}
+# Per-store nudge EVENTS — set by observe_response after a successful store so the
+# matching catch-up loop wakes IMMEDIATELY instead of sleeping out its poll
+# interval. Keyed by memory-store resource_key.
+#
+# WHY AN EVENT (not a bool): the loop's wait must be INTERRUPTIBLE. A plain bool +
+# `asyncio.sleep(interval)` cannot be woken — the flag was only read AFTER the
+# sleep completed, at a point where the loop was about to run a batch anyway, so
+# setting it did nothing (the nudge was pure theatre; a fresh memory still waited
+# out the full ~300s tick). An Event lets the loop do
+# `wait_for(event.wait(), timeout=interval)`:
+#   * store arrives while IDLE  → event fires → wake now, drain the backlog;
+#   * no store                  → timeout → the normal lazy catch-up tick (the
+#                                 floor that drains a post-restart backlog);
+#   * loop BUSY mid-batch       → it isn't waiting, so the set event simply means
+#                                 the NEXT iteration starts without sleeping. No
+#                                 stacking, no double-fire — busy is respected by
+#                                 construction.
+# Events are created by the loop at spawn (bound to the running loop); the store
+# side only ever `.set()`s one that already exists (`if key in _enrich_nudge`).
+_enrich_nudge: dict[str, "asyncio.Event"] = {}
 
 
 _BRIDGE_CONTEXT_RE = re.compile(
@@ -275,6 +291,51 @@ def _inbound_storage_suppressed(messages: list[dict]) -> bool:
         if not isinstance(content, str):
             return False
         return bool(_STORAGE_FALSE_RE.search(content))
+    return False
+
+
+_RECALL_FALSE_RE = re.compile(
+    r'<bridge_context\b[^>]*\brecall\s*=\s*["\']false["\'][^>]*>',
+    re.IGNORECASE,
+)
+
+
+def _inbound_recall_suppressed(ctx: "PipelineCtx") -> bool:
+    """True if THIS turn asked NOT to trigger recall (an agent reply shouldn't
+    drag the receiver's tangential memories in). Two sources, because recall is
+    read in ``modify_context`` (executor step 2) — BEFORE ``assemble_and_sign``
+    (step 4) renders the outbound block into message text:
+
+      1. ``ctx.bridge_context["_attr_recall"] == "false"`` — the BRIDGE-AUTHORED
+         path (async wake / any in-process delivery). ``_build_ctx`` popped the
+         sovereign ``_bridge_recall`` body key into this field; it is NOT yet in
+         message text at modify_context time, so we must read the field. (This is
+         the async-wake case — the reply lands as a plain user turn + the marker
+         rides the reserved key, gated on a synthetic caller in _build_ctx, so
+         it's sovereign — no HMAC needed, it never came from an external body.)
+      2. A signed ``recall="false"`` already in the last user turn's TEXT — the
+         RELAY path, where a different agent receives an already-signed reply
+         whose block sits in the inbound text (verify_inbound ran first, so a
+         forged marker was already stripped).
+
+    Contrast ``storage``, read in ``observe_response`` (after step 4) where the
+    block is always rendered into text — hence its text-only scan suffices."""
+    # Source 1: the structured attr (bridge-authored, present at step 2).
+    if str((getattr(ctx, "bridge_context", None) or {}).get("_attr_recall") or "") == "false":
+        return True
+    # Source 2: a signed marker already in the inbound user-turn text (relay).
+    for msg in reversed(getattr(ctx, "request", None).messages if getattr(ctx, "request", None) else []):
+        if not isinstance(msg, dict) or msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        if isinstance(content, list):  # multi-part — flatten text parts
+            content = " ".join(
+                p.get("text", "") for p in content
+                if isinstance(p, dict) and p.get("type") == "text"
+            )
+        if not isinstance(content, str):
+            return False
+        return bool(_RECALL_FALSE_RE.search(content))
     return False
 
 
@@ -362,6 +423,19 @@ async def modify_context(ctx: "PipelineCtx", config: dict) -> "PipelineCtx":
     # label_enrichment worker) is NOT a conversant — it must not recall memories
     # into its own labelling turn. No L3→L1 cascade for a worker.
     if config.get("tasks"):
+        return ctx
+
+    # RECALL-SUPPRESSED gate: a signed recall="false" on this turn's inbound
+    # <bridge_context> (e.g. an agent's async reply — bridge_messaging recall:false)
+    # means "don't pull memories into this turn". Skip the whole cascade. The
+    # marker is HMAC-verified by core before we run (a forged one was already
+    # stripped), so this only honours a genuine bridge-signed request. Mirror of
+    # the storage="false" store-skip in observe_response.
+    if _inbound_recall_suppressed(ctx):
+        logger.info(
+            f"conversational_memory: identity '{ctx.identity.key}' — inbound "
+            f"recall=\"false\" marker; skipping recall for this turn."
+        )
         return ctx
 
     resource_key = config.get("resource")
@@ -744,11 +818,14 @@ async def observe_response(ctx: "PipelineCtx", config: dict) -> None:
     )
 
     # STORE-SIDE NUDGE: a fresh memory landed in `resource_key` carrying the nonce
-    # marker. If a label-enrichment loop watches this store, wake it so the memory
-    # gets labelled within ~15s instead of waiting for the adaptive poll. Just a
-    # flag — the loop owns the store; this never blocks or fails the store path.
-    if resource_key in _enrich_nudge:
-        _enrich_nudge[resource_key] = True
+    # marker. If a label-enrichment loop watches this store, WAKE IT so the memory
+    # gets labelled now instead of sleeping out the adaptive poll (up to 300s).
+    # Setting the Event is non-blocking and can't fail the store path; the loop
+    # owns the store. A loop that is BUSY isn't waiting on the event — it simply
+    # starts its next iteration without sleeping (no stacking, no double-fire).
+    ev = _enrich_nudge.get(resource_key)
+    if ev is not None:
+        ev.set()
 
     # Mark the freshly stored memory as shown so it isn't re-injected next turn.
     try:
@@ -1052,8 +1129,10 @@ async def _enrichment_loop(store_key: str, conn: dict, worker: dict) -> None:
     batch_size = worker["batch_size"]
     worker_role = worker["role"]
 
-    # Register this store so observe_response's store-side nudge can wake us.
-    _enrich_nudge.setdefault(store_key, False)
+    # Register this store so observe_response's store-side nudge can wake us. The
+    # Event is created HERE (inside the running loop) so it binds to the right
+    # event loop; the store side only ever `.set()`s one that already exists.
+    _enrich_nudge.setdefault(store_key, asyncio.Event())
 
     logger.info(
         f"conversational_memory: enrichment loop '{store_key}' — warmup "
@@ -1062,10 +1141,6 @@ async def _enrichment_loop(store_key: str, conn: dict, worker: dict) -> None:
     await asyncio.sleep(_ENRICH_WARMUP_DELAY)
 
     while True:
-        if _enrich_nudge.get(store_key):
-            _enrich_nudge[store_key] = False
-            logger.debug(f"conversational_memory: enrichment '{store_key}' nudged")
-
         processed = 0
         remaining = 0
         try:
@@ -1099,9 +1174,33 @@ async def _enrichment_loop(store_key: str, conn: dict, worker: dict) -> None:
         if processed or remaining:
             logger.info(
                 f"conversational_memory: enrichment '{store_key}' processed={processed} "
-                f"remaining={remaining} next_tick={interval}s"
+                f"remaining={remaining} next_tick={interval}s (or sooner if nudged)"
             )
+        # INTERRUPTIBLE WAIT: sleep `interval` (the lazy catch-up floor — this is
+        # what drains a post-restart backlog) BUT wake early if a store nudges us.
+        # A plain asyncio.sleep here was why the nudge never worked.
+        await _wait_for_nudge(store_key, interval)
+
+
+async def _wait_for_nudge(store_key: str, interval: float) -> None:
+    """Wait up to ``interval`` seconds, returning EARLY if the store's nudge Event
+    fires (a fresh memory landed). Clears the event before returning so the next
+    wait is fresh. Falls back to a plain sleep if the store somehow has no event
+    (defensive — the loop always creates one at spawn)."""
+    ev = _enrich_nudge.get(store_key)
+    if ev is None:
         await asyncio.sleep(interval)
+        return
+    try:
+        await asyncio.wait_for(ev.wait(), timeout=interval)
+        logger.debug(
+            f"conversational_memory: enrichment '{store_key}' woken by a store "
+            f"(skipping the remaining wait)."
+        )
+    except asyncio.TimeoutError:
+        pass  # normal lazy tick — nothing new landed
+    finally:
+        ev.clear()
 
 
 def _enrich_interval(remaining: int) -> int:

@@ -102,7 +102,22 @@ _KNOWN_QUIRKS = (
     "mirror_reasoning_key",
     "close_trailing_orphan",
     "tidy_reasoning_whitespace",
+    "empty_content_floor",
 )
+
+# empty_content_floor — CLIENT-compat (render), not provider-compat. Some models
+# (Kimi) end a tool loop by reasoning to a conclusion and emitting ZERO visible
+# content — a turn that is `content:""` with only reasoning deltas, then
+# finish_reason:stop + [DONE]. The bridge faithfully pipes that (proven correct via
+# hang_probe 2026-07-11: it DOES send [DONE]/closes clean). But a picky client
+# (LibreChat) opens its "thinking" box on the reasoning, never receives a content
+# token to CLOSE it, and its spinner hangs forever though [DONE] arrived. This quirk
+# emits ONE minimal content delta (a single space — a render terminator, not
+# authored prose) before the terminal chunk when a turn would close with empty
+# content, so the client's render state machine completes. Default-OFF, per-identity
+# opt-in — a faithful buddy on a tolerant client gets nothing. ENFORCED in the
+# stream close (stream_intercept), not this module's hooks (see
+# stream_intercept._empty_content_floor_active, mirroring _tidy_reasoning_active).
 
 # tidy_reasoning_whitespace — collapse stray newlines in REASONING text.
 # Some models (Kimi via OpenRouter, on multi-lap tool turns) stream standalone

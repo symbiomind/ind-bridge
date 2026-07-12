@@ -119,6 +119,34 @@ def _tidy_reasoning_active(ctx: Any, pipeline: list) -> bool:
     return False
 
 
+def _empty_content_floor_active(ctx: Any, pipeline: list) -> bool:
+    """True if the quirks_mode `empty_content_floor` quirk is enabled for this
+    identity — so a turn that would close with EMPTY content gets one minimal
+    content delta before the terminal chunk (a render terminator for picky clients
+    like LibreChat that hang on a reasoning-only, content:"" turn). Reads the
+    quirks_mode tuple's resolved config off the pipeline; any import/shape hiccup →
+    False (faithful passthrough, never crash the stream). Mirrors
+    _tidy_reasoning_active."""
+    try:
+        from .plugins._builtin.quirks_mode import _enabled as _quirk_enabled
+        for tup in pipeline:
+            plugin = tup[1] if len(tup) > 1 else None
+            cfg = tup[2] if len(tup) > 2 else {}
+            mod = getattr(plugin, "__name__", "") or getattr(
+                getattr(plugin, "__class__", None), "__module__", ""
+            )
+            if "quirks_mode" in str(mod) and _quirk_enabled(cfg, "empty_content_floor"):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+# The minimal content delta the floor emits — a single space. It's a RENDER
+# TERMINATOR (closes the client's message/thinking box), not authored prose.
+_CONTENT_FLOOR = " "
+
+
 def _tidy_reasoning_delta(delta: dict) -> "dict | None":
     """Tidy a single reasoning delta for the live client relay: a newline-only
     delta is dropped (return None — Kimi's standalone `\\n` tokens), and a delta
@@ -266,6 +294,20 @@ async def stream_with_intercepts(
     """
     model = ctx.request.model
     uncapped = max_tool_laps <= 0
+    # quirks_mode `empty_content_floor` (default-OFF, per-identity opt-in): emit a
+    # minimal content delta before closing a turn that ended with EMPTY content, so
+    # a picky client (LibreChat) that hangs on a reasoning-only turn closes its
+    # render. Resolved once here off the pipeline. A no-op for faithful buddies.
+    floor_active = _empty_content_floor_active(ctx, pipeline)
+
+    def _closing_content_floor(recon_content: "str | None"):
+        """Yield the floor delta iff the quirk is active AND the turn is closing
+        with empty content. Returns the emitted bytes (or None) so callers can
+        `if (b := ...): yield b`. Kept as a plain fn (not a sub-generator) so each
+        close site stays a single explicit `yield`."""
+        if floor_active and not (recon_content or "").strip():
+            return _content_chunk(_CONTENT_FLOOR, model)
+        return None
 
     async def _run_on_complete(fn, ctx) -> None:
         """Run the save (on_complete) with a visibility log on either side, so a
@@ -387,6 +429,11 @@ async def stream_with_intercepts(
                 # the upstream never sent a finish_reason chunk — rare drift —
                 # synthesise one so the client still gets a clean close.)
                 if not swallowing:
+                    # empty_content_floor: if this turn is closing with no visible
+                    # content (reasoning-only), give the client a minimal content
+                    # delta so its render completes (quirk-gated; no-op otherwise).
+                    if (floor := _closing_content_floor(recon.get("content"))):
+                        yield floor
                     if not _lap_forwarded_finish_reason(lap_chunks):
                         yield _terminal_chunk(finish_reason or "stop", model)
                     yield _DONE_LINE
@@ -567,6 +614,18 @@ async def stream_with_intercepts(
                 f"stream_intercept: identity='{ctx.identity.key}' stream cancelled "
                 f"mid-flight (client disconnect / scope teardown) at lap {lap} — "
                 f"re-raising; finally will persist what completed."
+            )
+            raise
+        except GeneratorExit:
+            # The consumer (Starlette) stopped iterating and threw GeneratorExit
+            # into our yield. It's BaseException (skips the Exception handler below),
+            # and we CANNOT yield during it — so we just log the teardown distinctly
+            # (a future client-close-without-[DONE] is then VISIBLE, not inferred)
+            # and re-raise; the finally still persists what completed.
+            logger.debug(
+                f"stream_intercept: identity='{ctx.identity.key}' generator closed "
+                f"by consumer (GeneratorExit) at lap {lap}; "
+                f"closed={ctx.plugin_data.get('stream_intercept.closed')}"
             )
             raise
         except Exception as e:

@@ -98,10 +98,13 @@ model-facing — same family as ``storage`` / ``output`` / ``caller``):
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 import logging
 import re
+import time
+import uuid
 from typing import TYPE_CHECKING
 
 from app import bridge_native
@@ -136,7 +139,7 @@ collisions on one identity."""
 # set it via `additional` is rejected — the recipient decides what instruction they need,
 # not the sender.
 _RESERVED_ATTRS = frozenset({
-    "caller", "trust", "tool", "storage", "signed", "timestamp", "information",
+    "caller", "trust", "tool", "storage", "recall", "signed", "timestamp", "information",
 })
 
 _BRIDGE_TRUST = "bridge_messaging"
@@ -151,6 +154,41 @@ _DEFAULT_INFORMATION = (
     "just respond normally in chat — no tool call needed; the bridge routes your reply "
     "back to the sender."
 )
+
+# Output-aware default: on a fire-and-forget (output:false) send the sender is NOT
+# waiting for a reply and the recipient's reply is NOT routed anywhere — so the
+# round-trip default above would over-promise ("the bridge routes your reply back"
+# when nothing does). This variant tells the honest truth: it's a notification.
+# Deliberately says NOTHING about how to reply — on a delivery turn the send tool is
+# withheld by the loop-break (modify_context), so any "use the tool to reply"
+# instruction would be a lie-in-mechanism (enforcement beats prose). If the recipient
+# genuinely wants to reach back, that's a fresh, separate send THEY initiate later —
+# not something this delivery turn can do. Overridable per-recipient-role exactly like
+# the round-trip default; `information: false`/"" omits it.
+_DEFAULT_INFORMATION_NOREPLY = (
+    "You are receiving a notification from another agent via bridge_messaging. This is "
+    "fire-and-forget: no reply is expected or routed back to the sender. Read it and "
+    "carry on; there is nothing to send in response."
+)
+
+# Async (output:async) recipient default: the sender delegated a task and carried on;
+# your reply IS wanted, just not synchronously — the bridge delivers it to the sender as
+# a later chat turn. Like the round-trip default, tells the recipient to just reply in
+# chat (no tool). Deliberately no tool instruction → sidesteps the loop-break landmine
+# (the mailbox is bridge-side, not a recipient tool-call). Overridable per-recipient-role.
+_DEFAULT_INFORMATION_ASYNC = (
+    "You are receiving a delegated task from another agent via bridge_messaging. Do the "
+    "work and reply normally in chat — no tool call needed; the bridge delivers your reply "
+    "back to the sender as a later message when you're done. Take the time you need."
+)
+
+# The sovereign trust value stamped on an ASYNC WAKE turn — the deferred reply arriving
+# back on the ORIGINAL SENDER's session as a role:user turn. Distinct from _BRIDGE_TRUST
+# on purpose: the loop-break (modify_context) withholds send/list tools ONLY on a
+# trust==bridge_messaging DELIVERY turn. A wake turn must NOT withhold the sender's own
+# tools — they need to act on the result and possibly delegate again. A different trust
+# value sails past the loop-break's string match. Also reserved (can't be forged).
+_ASYNC_DEFERRED_TRUST = "async-deferred"
 
 
 # ---------------------------------------------------------------------------
@@ -282,7 +320,15 @@ _TOOL_DEFINITIONS = {
             "description": (
                 "Send a message to another agent by name (see bridge_messaging_list). "
                 "Use this to ask another agent a question or pass them something. By "
-                "default you get their reply back."
+                "default their reply comes back to you AS THE RESULT OF THIS TOOL CALL. "
+                "This is ONE-SHOT: sending does NOT open a linked chat with them and does "
+                "NOT connect their session to yours. If you want to say something more "
+                "after reading their reply, call bridge_messaging_send AGAIN — replying "
+                "in your own chat does not reach them. "
+                "For a long task, set output:\"async\" to DELEGATE: the tool returns "
+                "immediately with a tracking id and you carry on; the agent's reply "
+                "arrives later as a new message in your chat (tagged with that id). Fire "
+                "several async tasks, end your turn, and act on each reply as it lands."
                 # NOTE: deliberately NO `caller` param — you always message AS yourself;
                 # the bridge stamps your identity. `output`/`storage` are operator-set,
                 # not usually for the model to fiddle, but exposed for completeness.
@@ -308,8 +354,16 @@ _TOOL_DEFINITIONS = {
                         ),
                     },
                     "output": {
-                        "type": "boolean",
-                        "description": "Whether to wait for and return their reply (default true).",
+                        "description": (
+                            "How you get the reply. true (default): wait, reply comes back "
+                            "as this tool's result. false: fire-and-forget, no reply. "
+                            "\"async\": delegate — return now with a tracking id, reply "
+                            "arrives later as a new message in your chat."
+                        ),
+                        "oneOf": [
+                            {"type": "boolean"},
+                            {"type": "string", "enum": ["async"]},
+                        ],
                     },
                 },
                 "required": ["to", "message"],
@@ -515,10 +569,22 @@ async def _handle_send(ctx: "PipelineCtx", args: dict, config: dict) -> str:
     # inside the caller's pipeline, so ctx.role.key / ctx.identity is the truth.
     sovereign_caller = _resolve_sovereign_caller(ctx, eff)
 
-    output = args.get("output", eff.get("output", True))
-    output = bool(output) if not isinstance(output, bool) else output
+    # `output` is TRI-VALUED (back-compat with the old boolean):
+    #   true  / True        → round-trip: block, return the recipient's reply as the
+    #                         tool result (the default).
+    #   false / False       → fire-and-forget: return "[delivered]", discard the reply.
+    #   "async"             → detached delegation: fire the recipient in a background
+    #                         task, return "[async sent, id=X]" NOW, and when it finishes
+    #                         WAKE the sender with the reply as a role:user turn.
+    # _resolve_output_mode normalises to one of "true"/"false"/"async".
+    output_mode = _resolve_output_mode(args.get("output", eff.get("output", True)))
+    # `output` boolean kept for the existing information-text branch (true vs not-true).
+    output = output_mode == "true"
     # storage is operator policy (not normally model-set): role config, default true.
     storage = bool(eff.get("storage", True))
+    # recall (default true) — mirror of storage. When false, the receiver's
+    # conversational_memory skips recalling memories INTO this delivered turn.
+    recall = bool(eff.get("recall", True))
 
     # THE MESSAGE IS THE VOICE — nothing else. An agent-to-agent message arrives as
     # a normal user turn, and a user turn must be JUST what was said. We do NOT prepend
@@ -567,6 +633,10 @@ async def _handle_send(ctx: "PipelineCtx", args: dict, config: dict) -> str:
     # add/flip it. Only stamped when the operator asked for ephemerality.
     if not storage:
         body["_bridge_storage"] = "false"
+    # `recall` rides the same ENVELOPE rail as storage (signed <bridge_context>
+    # attr). Only stamped when the operator turned it off.
+    if not recall:
+        body["_bridge_recall"] = "false"
     extra_additional = dict(raw_additional)
     extra_additional["tool"] = bridge_native.apply_namespace("bridge_messaging_send")
     # `information` — a bridge-owned reply-instruction stamped onto the SIGNED <caller> so
@@ -579,7 +649,20 @@ async def _handle_send(ctx: "PipelineCtx", args: dict, config: dict) -> str:
     # in the signed envelope, never in words the sender didn't speak).
     from app import config as config_mod
     recipient_cfg = _role_bridge_messaging_cfg(config_mod.resolve_role(target) or {})
-    info = recipient_cfg.get("information", _DEFAULT_INFORMATION)
+    # OUTPUT-AWARE built-in default: a round-trip (output:true) send gets the
+    # "reply in chat, the bridge routes it back" text; a fire-and-forget
+    # (output:false) send gets the honest "notification, nothing routed back"
+    # text so the recipient doesn't craft a reply that evaporates. An explicit
+    # recipient-role `information` override wins for BOTH modes (the operator's
+    # deliberate choice); only the built-in fallback branches on `output`. The
+    # "key present?" opt-out (`information: false`/"") still suppresses either.
+    if output_mode == "async":
+        default_info = _DEFAULT_INFORMATION_ASYNC
+    elif output_mode == "true":
+        default_info = _DEFAULT_INFORMATION
+    else:
+        default_info = _DEFAULT_INFORMATION_NOREPLY
+    info = recipient_cfg.get("information", default_info)
     if info:
         extra_additional["information"] = str(info)
     body["_cron_additional"] = extra_additional  # reuses the proven per-turn additional inject
@@ -587,8 +670,26 @@ async def _handle_send(ctx: "PipelineCtx", args: dict, config: dict) -> str:
     carrier = entry["carrier_identity_key"]
     logger.info(
         f"bridge_messaging: '{sovereign_caller}' → '{target}' "
-        f"(carrier '{carrier}', output={output}, storage={storage})"
+        f"(carrier '{carrier}', output={output_mode}, storage={storage})"
     )
+
+    # ── output:async — detached delegation with wake-back ───────────────────
+    # Fire the recipient turn in a BACKGROUND task and return to the sender NOW.
+    # When it finishes, WAKE the sender: execute() the sender's own identity with
+    # the recipient's reply as a role:user turn carrying the async-deferred
+    # envelope. The sender's turn queue (step 2) serialises that wake behind
+    # whatever they're doing, so it's safe even mid-turn. See _spawn_async_delivery.
+    if output_mode == "async":
+        call_id = _new_call_id()
+        _spawn_async_delivery(
+            carrier=carrier,
+            body=body,
+            target=target,
+            sender_identity_key=ctx.identity.key,   # Sonnet #4: the IDENTITY key, not role/display
+            sender_caller=sovereign_caller,
+            call_id=call_id,
+        )
+        return f"[async sent to {target}, id={call_id} — reply will arrive as a later message]"
 
     try:
         resp = await pipeline_executor.execute(carrier, body, {})
@@ -606,6 +707,177 @@ async def _handle_send(ctx: "PipelineCtx", args: dict, config: dict) -> str:
     if reply is None:
         return f"[bridge_messaging: {target} received the message but sent no reply]"
     return reply
+
+
+# ---------------------------------------------------------------------------
+# output:async — detached delegation with wake-back
+# ---------------------------------------------------------------------------
+#
+# The sender delegates a task and carries on; the recipient's reply arrives LATER
+# as a role:user turn on the sender's OWN session (the async-deferred envelope).
+# This is cron's twin: a self-originating turn, triggered by "sub-agent finished"
+# instead of a clock. The sender's turn queue (pipeline_executor, step 2)
+# serialises the wake behind whatever the sender is doing, so a wake landing
+# mid-turn just queues — never a concurrent write.
+#
+# Task lifecycle: each detached delivery is tracked in _async_tasks so the bridge
+# lifespan shutdown can cancel any in-flight delegation cleanly (mcp_client
+# _owner_tasks pattern). A task removes itself on completion.
+
+_async_tasks: set[asyncio.Task] = set()
+
+
+def _resolve_output_mode(raw) -> str:
+    """Normalise the tri-valued `output` arg to 'true' | 'false' | 'async'.
+    Back-compat: the historical boolean maps to 'true'/'false'. The string
+    'async' (case-insensitive) selects detached delegation. Anything else falls
+    back to truthiness → 'true'/'false' (never crashes on a weird value)."""
+    if isinstance(raw, str) and raw.strip().lower() == "async":
+        return "async"
+    if isinstance(raw, bool):
+        return "true" if raw else "false"
+    # Non-bool, non-"async": treat by truthiness (e.g. "true"/"false" strings,
+    # 1/0). "false" the STRING is truthy in Python, so match it explicitly.
+    if isinstance(raw, str) and raw.strip().lower() in ("false", "0", "no"):
+        return "false"
+    return "true" if raw else "false"
+
+
+def _new_call_id() -> str:
+    """Short, unique-enough correlation id for an async delegation (surfaces in
+    the sender's '[async sent, id=…]' stub AND the wake envelope's identifier, so
+    the sender can map a drifting-back reply to the question it answers)."""
+    return uuid.uuid4().hex[:8]
+
+
+def _spawn_async_delivery(
+    *,
+    carrier: str,
+    body: dict,
+    target: str,
+    sender_identity_key: str,
+    sender_caller: str,
+    call_id: str,
+) -> None:
+    """Fire the recipient turn in a detached background task; on completion (or
+    failure), wake the sender with the reply. Tracked in _async_tasks so shutdown
+    cancels cleanly. Fire-and-forget from the caller's perspective — this returns
+    immediately, the work happens off the caller's turn."""
+    original_call = time.strftime("%H:%M")  # human-friendly stamp for the envelope
+
+    async def _run():
+        from app import pipeline_executor
+        try:
+            resp = await pipeline_executor.execute(carrier, body, {})
+            reply = _extract_reply_text(resp)
+            if reply is None:
+                reply = f"[{target} received the delegated task but sent no reply]"
+            error = False
+        except Exception as e:
+            # Sonnet #2: a detached failure must still WAKE the sender with an
+            # error-shaped reply — NEVER eternal silence. asyncio would otherwise
+            # swallow this exception and the sender waits forever.
+            logger.exception(
+                f"bridge_messaging: async delivery to '{target}' "
+                f"(id={call_id}) raised — waking sender with an error reply"
+            )
+            reply = f"[your delegated task to {target} failed: {type(e).__name__}: {e}]"
+            error = True
+        try:
+            await _wake_sender(
+                sender_identity_key=sender_identity_key,
+                reply=reply,
+                from_agent=target,
+                call_id=call_id,
+                original_call=original_call,
+                error=error,
+            )
+        except Exception:
+            logger.exception(
+                f"bridge_messaging: async wake-back to sender "
+                f"'{sender_identity_key}' (id={call_id}) failed"
+            )
+
+    task = asyncio.ensure_future(_run())
+    _async_tasks.add(task)
+    task.add_done_callback(_async_tasks.discard)
+
+
+async def _wake_sender(
+    *,
+    sender_identity_key: str,
+    reply: str,
+    from_agent: str,
+    call_id: str,
+    original_call: str,
+    error: bool,
+) -> None:
+    """Wake the ORIGINAL SENDER with the deferred reply as a role:user turn.
+
+    Runs execute() on the SENDER's own identity (Sonnet #4: identity key, not
+    role/display — waking the wrong key wakes the wrong session-instance). The
+    reply rides as a normal user turn; the async-deferred envelope goes in the
+    signed <caller> via the reserved-key → sign primitive:
+      * _bridge_caller  = the responder's name (`from_agent`) — WHO the reply is from
+      * _bridge_trust   = "async-deferred" — the DISTINCT marker so the loop-break
+                          does NOT withhold the sender's own send tools on this turn
+      * _cron_additional = identifier/from/original_call/session correlation attrs
+    The RESPONDER's storage/recall policy is honoured on this wake turn: an async
+    reply is a live user turn on the sender's session, so without these it would
+    be recalled-against AND stored like any human turn. `from_agent` IS the
+    responder's role key (the original send `target`, phonebook-validated), so we
+    resolve its bridge_messaging config and stamp `_bridge_storage`/`_bridge_recall`
+    — same signed-envelope rail as a direct send. (`_wake_sender` previously
+    stamped NEITHER; a responder with `recall:false`/`storage:false` now applies
+    on the async path too.)
+
+    basic_session persists it through the normal (turn-queue-serialised) path — the
+    wake just queues behind any in-flight sender turn."""
+    from app import pipeline_executor
+    from app import config as config_mod
+
+    extra_additional = {
+        "identifier": call_id,
+        "from": from_agent,
+        "original_call": original_call,
+        "session": "none",  # the reply-envelope carries its own provenance;
+                            # the responder may be a session-less one-shot sub-agent
+    }
+    if error:
+        extra_additional["delivery"] = "failed"
+
+    body = {
+        "messages": [{"role": "user", "content": reply}],
+        "stream": False,
+        "_bridge_caller": from_agent,
+        "_bridge_trust": _ASYNC_DEFERRED_TRUST,
+        "_cron_additional": extra_additional,
+    }
+    # Honour the responder's storage/recall policy on the wake turn (both default
+    # true → stamp only when the responder set them false). from_agent = the
+    # responder's role key.
+    responder_cfg = _role_bridge_messaging_cfg(config_mod.resolve_role(from_agent) or {})
+    if not bool(responder_cfg.get("storage", True)):
+        body["_bridge_storage"] = "false"
+    if not bool(responder_cfg.get("recall", True)):
+        body["_bridge_recall"] = "false"
+    logger.info(
+        f"bridge_messaging: async wake — '{from_agent}' → sender identity "
+        f"'{sender_identity_key}' (id={call_id}, error={error})"
+    )
+    await pipeline_executor.execute(sender_identity_key, body, {})
+
+
+async def shutdown() -> None:
+    """Cancel any in-flight async deliveries on bridge shutdown so detached
+    tasks don't leak. Best-effort (mirrors mcp_client.shutdown)."""
+    for task in list(_async_tasks):
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
 
 
 def _sender_policy_cfg(ctx: "PipelineCtx") -> dict:

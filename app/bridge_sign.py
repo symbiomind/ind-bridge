@@ -85,6 +85,7 @@ _SIGNED_ATTR_RE = re.compile(r'\bsigned="([0-9a-fA-F]+)"')
 _TIMESTAMP_ATTR_RE = re.compile(r'\btimestamp="(\d+)"')
 _WARNING_ATTR_RE = re.compile(r'\bwarning="([^"]*)"')
 _STORAGE_ATTR_RE = re.compile(r'\bstorage="([^"]*)"')
+_RECALL_ATTR_RE = re.compile(r'\brecall="([^"]*)"')
 
 _ANY_BRIDGE_CONTEXT_RE = re.compile(r"<bridge_context\b", re.DOTALL)
 """Cheap presence-probe for ANY bridge_context opening tag, anywhere in a body
@@ -269,15 +270,23 @@ def assemble_and_sign(ctx: PipelineCtx) -> PipelineCtx:
     storage = str((ctx.bridge_context or {}).get("_attr_storage") or "")
     storage_attr = f' storage="{_attr_escape(storage)}"' if storage else ""
 
+    # Recall marker (signed, opening-tag attribute) — mirror of storage.
+    # bridge_messaging sets `_attr_recall="false"` so the RECEIVER's
+    # conversational_memory skips recalling memories INTO this turn (an agent
+    # reply shouldn't drag the receiver's tangential memories in). Rendered AFTER
+    # storage and folded into the signature in the same order (load-bearing).
+    recall = str((ctx.bridge_context or {}).get("_attr_recall") or "")
+    recall_attr = f' recall="{_attr_escape(recall)}"' if recall else ""
+
     if secret:
         ts = int(time.time())
-        sig = _hmac(inner, ts, secret, warning, storage)
+        sig = _hmac(inner, ts, secret, warning, storage, recall)
         warn_attr = f' warning="{_attr_escape(warning)}"' if warning else ""
-        opening = f'<bridge_context signed="{sig}" timestamp="{ts}"{warn_attr}{storage_attr}>'
+        opening = f'<bridge_context signed="{sig}" timestamp="{ts}"{warn_attr}{storage_attr}{recall_attr}>'
     else:
         # Unsigned dev mode: still emit the attrs (legibility), just unsigned.
         warn_attr = f' warning="{_attr_escape(warning)}"' if warning else ""
-        opening = f"<bridge_context{warn_attr}{storage_attr}>"
+        opening = f"<bridge_context{warn_attr}{storage_attr}{recall_attr}>"
 
     block = f"{opening}\n{inner}\n</bridge_context>"
 
@@ -359,16 +368,19 @@ def _is_block_valid(full_block: str, secret: str) -> bool:
         return False
     inner = inner_match.group(1).strip()
 
-    # The warning + storage attrs (when present) are part of the signed material.
-    # Read them back UNESCAPED so they match the raw strings fed to _hmac at sign
-    # time (assemble_and_sign escapes only for XML attribute rendering, signs the
-    # raw text). Absent → empty → historical signing form.
+    # The warning + storage + recall attrs (when present) are part of the signed
+    # material. Read them back UNESCAPED so they match the raw strings fed to
+    # _hmac at sign time (assemble_and_sign escapes only for XML attribute
+    # rendering, signs the raw text). Absent → empty → historical signing form.
+    # Order MUST match the fold in _hmac: warning → storage → recall.
     warn_m = _WARNING_ATTR_RE.search(full_block)
     warning = _attr_unescape(warn_m.group(1)) if warn_m else ""
     storage_m = _STORAGE_ATTR_RE.search(full_block)
     storage = _attr_unescape(storage_m.group(1)) if storage_m else ""
+    recall_m = _RECALL_ATTR_RE.search(full_block)
+    recall = _attr_unescape(recall_m.group(1)) if recall_m else ""
 
-    actual_sig = _hmac(inner, ts, secret, warning, storage)
+    actual_sig = _hmac(inner, ts, secret, warning, storage, recall)
 
     # Constant-time comparison to defend against timing oracles
     return hmac.compare_digest(expected_sig, actual_sig)
@@ -379,22 +391,28 @@ def _is_block_valid(full_block: str, secret: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def _hmac(inner: str, timestamp: int, secret: str, warning: str = "",
-          storage: str = "") -> str:
+          storage: str = "", recall: str = "") -> str:
     """HMAC-SHA256 over ``inner.strip() + "|" + timestamp [+ "|" + warning]
-    [+ "|storage=" + storage]``, keyed by ``secret``.
+    [+ "|storage=" + storage] [+ "|recall=" + recall]``, keyed by ``secret``.
 
     The ``strip()`` ensures whitespace differences between assembly and
     verification don't break signatures (the assembler uses ``\\n``-joined
     parts; verification reads what's between tags which may have leading/
     trailing newlines from formatting).
 
-    ``warning`` (optional) is the signed disambiguation attr. ``storage``
-    (optional) is the signed turn-handling marker (bridge_messaging sets
-    ``"false"`` for an ephemeral turn). BOTH are opening-tag ``<bridge_context>``
-    attributes folded into the signed material so they're tamper-evident — a
-    downstream party can't add, remove, or alter them without breaking the
-    signature. When empty, the signed material is identical to the historical
-    form (backward-compatible with existing blocks that carry neither).
+    ``warning`` (optional) is the signed disambiguation attr. ``storage`` and
+    ``recall`` (optional) are signed turn-handling markers (bridge_messaging sets
+    ``"false"`` to make a turn ephemeral (storage=skip-store) and/or
+    recall-suppressed (recall=skip-recall-inject)). All are opening-tag
+    ``<bridge_context>`` attributes folded into the signed material so they're
+    tamper-evident — a downstream party can't add, remove, or alter them without
+    breaking the signature.
+
+    FOLD ORDER IS LOAD-BEARING: warning → storage → recall, each appended ONLY
+    when present. Sign and verify MUST build the fold in this exact order. A
+    block carrying none of them signs identically to the historical form
+    (backward-compatible with every existing block), and a storage-only block
+    signs exactly as it did before ``recall`` existed.
 
     Returns the first ``_SIG_LENGTH`` hex chars of the digest.
     """
@@ -411,6 +429,12 @@ def _hmac(inner: str, timestamp: int, secret: str, warning: str = "",
         # signed material. A block with NO storage marker signs exactly as
         # before (backward-compatible).
         message = f"{message}|storage={storage}"
+    if recall:
+        # Same fold for the recall marker, appended AFTER storage (order is
+        # load-bearing — see docstring). Prefixed with "recall=" like storage.
+        # A block with NO recall marker signs exactly as before (so every
+        # pre-recall block, including storage-only, is unaffected).
+        message = f"{message}|recall={recall}"
     digest = hmac.new(
         secret.encode("utf-8"),
         message.encode("utf-8"),
