@@ -70,7 +70,15 @@ just a vehicle to materialise the role's pipeline; its own ``<caller>`` is overr
 
 Two send flags, orthogonal:
   * ``output``  (default true)  — return the recipient's reply to the caller. false =
-    fire-and-forget; the caller gets a terse delivered-signal, not a reply.
+    fire-and-forget; the caller gets a terse delivered-signal, not a reply. "async" =
+    detached delegation (reply arrives later as a chat turn).
+    **Operator is sovereign, model chooses in the silence:** when the sender's block sets
+    ``output``, that is a CONTRACT and a model-supplied ``output`` arg cannot override it.
+    An operator who pins ``output: false`` is declaring the send one-way BY DESIGN — e.g. a
+    notify-only sender, or a scheduled job that must deposit and never open a conversation —
+    and a model must not be able to talk its way into a round-trip. When the operator has
+    NOT set it, the model may choose — only the caller knows whether its target can answer
+    at all (a log / file sink / write-only resource has no reply to wait for).
   * ``storage`` (default true)  — false stamps ``storage="false"`` as a signed attribute
     on the ``<bridge_context>`` envelope (a TURN-property, not a ``<caller>`` identity
     attr): a universal "this turn is ephemeral, any plugin that PERSISTS the pair should
@@ -328,10 +336,19 @@ _TOOL_DEFINITIONS = {
                 "For a long task, set output:\"async\" to DELEGATE: the tool returns "
                 "immediately with a tracking id and you carry on; the agent's reply "
                 "arrives later as a new message in your chat (tagged with that id). Fire "
-                "several async tasks, end your turn, and act on each reply as it lands."
+                "several async tasks, end your turn, and act on each reply as it lands. "
+                "If you want an answer, you want the default (true) or \"async\" — NOT "
+                "output:false, which throws the message into a void and tells you nothing "
+                "came back. Only choose false when the target genuinely cannot answer you "
+                "(a log, a file sink, a write-only resource) or when you truly do not care "
+                "whether it did."
                 # NOTE: deliberately NO `caller` param — you always message AS yourself;
-                # the bridge stamps your identity. `output`/`storage` are operator-set,
-                # not usually for the model to fiddle, but exposed for completeness.
+                # the bridge stamps your identity. `storage` is operator-set (read from
+                # `eff` only). `output` IS model-facing on purpose: a send to a sink/
+                # file/write-only resource has no reply to wait for, and only the caller
+                # knows that. But false is a DEAD END for the sender — say so plainly
+                # here, because the recipient-side _DEFAULT_INFORMATION_NOREPLY already
+                # tells the RECIPIENT the honest truth and the sender deserves the same.
             ),
             "parameters": {
                 "type": "object",
@@ -355,10 +372,19 @@ _TOOL_DEFINITIONS = {
                     },
                     "output": {
                         "description": (
-                            "How you get the reply. true (default): wait, reply comes back "
-                            "as this tool's result. false: fire-and-forget, no reply. "
-                            "\"async\": delegate — return now with a tracking id, reply "
-                            "arrives later as a new message in your chat."
+                            "How you get the reply. true (default): wait, and their reply "
+                            "comes back as this tool's result — use this when you want an "
+                            "answer now. \"async\": delegate — returns immediately with a "
+                            "tracking id, and their reply arrives later as a new message "
+                            "in your chat; use this when you want an answer but don't want "
+                            "to block. false: NO REPLY EVER — the message is delivered and "
+                            "the answer, if any, is discarded; you get a bare "
+                            "delivered-signal and you will never learn what they said. "
+                            "This is a dead end, not a faster true: if you would be "
+                            "disappointed to hear nothing back, do not choose it. It is "
+                            "the right choice ONLY when the target cannot answer you (a "
+                            "log, a file sink, a write-only resource) or when you genuinely "
+                            "do not care about the response."
                         ),
                         "oneOf": [
                             {"type": "boolean"},
@@ -562,8 +588,8 @@ async def _handle_send(ctx: "PipelineCtx", args: dict, config: dict) -> str:
     # routing policy). Slot-family-proof: a single-block config lives in
     # context.plugins so the handle_tool_calls `config` is empty of these keys;
     # `eff` merged the role's actual block under the slot config, so storage no
-    # longer silently defaults to true (which would LEAK the dream into the
-    # recipient's conversational_memory).
+    # longer silently defaults to true (which would LEAK an ephemeral message into
+    # the recipient's conversational_memory).
     #
     # Tool path: the caller is the LIVE calling identity — never from args. We are
     # inside the caller's pipeline, so ctx.role.key / ctx.identity is the truth.
@@ -577,7 +603,21 @@ async def _handle_send(ctx: "PipelineCtx", args: dict, config: dict) -> str:
     #                         task, return "[async sent, id=X]" NOW, and when it finishes
     #                         WAKE the sender with the reply as a role:user turn.
     # _resolve_output_mode normalises to one of "true"/"false"/"async".
-    output_mode = _resolve_output_mode(args.get("output", eff.get("output", True)))
+    #
+    # OPERATOR IS SOVEREIGN, MODEL CHOOSES IN THE SILENCE. When the operator has
+    # explicitly set `output` on the sender's block, that is a CONTRACT and the model
+    # cannot talk its way out of it — same family as `storage` / `caller` (below), which
+    # never read args at all. When the operator has NOT set it, the model picks: only the
+    # caller knows whether its target can actually answer (a send to a log / file sink /
+    # write-only resource has no reply to wait for), so `output` stays model-facing there.
+    # WHY THIS MATTERS: an operator pinning output:false has declared the send ONE-WAY BY
+    # DESIGN (a notify-only sender; a scheduled job that must deposit and never open a
+    # conversation). A model emitting output:"async"/true in its tool args must not be able
+    # to override that policy and start a round-trip the operator deliberately foreclosed.
+    if "output" in eff:
+        output_mode = _resolve_output_mode(eff["output"])
+    else:
+        output_mode = _resolve_output_mode(args.get("output", True))
     # `output` boolean kept for the existing information-text branch (true vs not-true).
     output = output_mode == "true"
     # storage is operator policy (not normally model-set): role config, default true.
