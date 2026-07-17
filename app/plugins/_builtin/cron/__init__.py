@@ -136,8 +136,8 @@ def _build_job(identity_key: str, job_name: str, job_cfg, identity_tz: str) -> d
     Prompt FILES are NOT read here — the job stores its prompt *spec* and the
     authoritative read happens at fire time (``_resolve_prompt`` in ``_fire``),
     mirroring how ``system_prompt`` re-reads per request. This is what makes an
-    edit to a cron prompt file (dream fuel, HEARTBEAT.md) go live on the next
-    fire with no bridge restart. We still validate the prompt spec loudly here
+    edit to a cron prompt file (e.g. HEARTBEAT.md, a daily digest) go live on the
+    next fire with no bridge restart. We still validate the prompt spec loudly here
     (``validate_only=True``) so a structurally-broken job fails at startup."""
     if not isinstance(job_cfg, dict):
         logger.warning(
@@ -361,8 +361,8 @@ async def _fire(identity_key: str, job: dict) -> None:
     The response is DISCARDED — basic_session has already persisted the turn.
 
     The prompt is resolved HERE, at fire time — files are read fresh — so an
-    edit to a cron prompt file (dream fuel, HEARTBEAT.md) takes effect on the
-    next fire with no bridge restart. If the prompt resolves empty now (e.g. the
+    edit to a cron prompt file (e.g. HEARTBEAT.md, a daily digest) takes effect on
+    the next fire with no bridge restart. If the prompt resolves empty now (e.g. the
     file was deleted or emptied mid-day), skip this fire gracefully rather than
     send an empty turn; the loop lives on for the next tick."""
     from app import pipeline_executor

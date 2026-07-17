@@ -695,9 +695,10 @@ async def observe_response(ctx: "PipelineCtx", config: dict) -> None:
     # We still recalled normally this turn (modify_context already fired); we
     # only skip the STORE. The flag rides in the signed <bridge_context> on the
     # inbound user turn, so reading it is tamper-proof (forging it requires the
-    # signing secret). The dreamer uses this so a dream colours the morning but
-    # fades from recall — basic_session still keeps it (the session is the
-    # conversation), only conv_mem forgets it. See bridge_messaging plugin.
+    # signing secret). A sender uses this when a message should land and act on the
+    # recipient NOW but not persist into their long-term recall — basic_session still
+    # keeps it (the session IS the conversation), only conv_mem forgets it. See the
+    # bridge_messaging plugin.
     if _inbound_storage_suppressed(ctx.request.messages):
         logger.info(
             "conversational_memory: inbound caller set storage=\"false\" "
