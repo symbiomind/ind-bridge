@@ -29,6 +29,10 @@ Config knobs:
         token:  sk-...         # bearer token
         model:  some/model     # overrides the inbound model (per-identity)
         headers: {x-org: ...}  # custom headers merged on the outbound call
+        params:                # extra request-BODY params merged into the outbound
+          reasoning: {exclude: true}   #   call. Operator-set → CONFIG WINS over any
+          temperature: 0.8             #   same key the client sent (same sovereignty
+          provider: {order: [...]}     #   as `model`). Top-level keys only, shallow.
 """
 
 from __future__ import annotations
@@ -230,5 +234,18 @@ def apply_outbound_params(ctx: "PipelineCtx", config: dict) -> "PipelineCtx":
     model = config.get("model")
     if model:
         ctx.request.model = model
+
+    # Extra request-BODY params (reasoning / temperature / provider / …). Stashed
+    # here; the executor's _build_outbound_request merges them into the outbound
+    # body AFTER assembling from raw_body, so CONFIG WINS over any same key the
+    # client sent — operator policy is sovereign, same law as `model` above and as
+    # bridge_messaging's `output`. Shallow top-level merge; a later param can nest.
+    params = config.get("params")
+    if isinstance(params, dict) and params:
+        existing = ctx.plugin_data.get("openai-protocol.params", {})
+        if not isinstance(existing, dict):
+            existing = {}
+        existing.update(params)
+        ctx.plugin_data["openai-protocol.params"] = existing
 
     return ctx

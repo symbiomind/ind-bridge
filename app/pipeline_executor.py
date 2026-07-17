@@ -826,6 +826,9 @@ def _build_ctx(identity_key: str, raw_body: dict, headers: dict[str, str]) -> Pi
     max_tool_laps = _resolve_max_tool_laps(
         identity_cfg, role_cfg, session_cfg, resource_cfg, server_cfg,
     )
+    retry = _resolve_retry(
+        identity_cfg, role_cfg, session_cfg, resource_cfg, server_cfg,
+    )
 
     ctx = PipelineCtx(
         identity=identity,
@@ -834,6 +837,7 @@ def _build_ctx(identity_key: str, raw_body: dict, headers: dict[str, str]) -> Pi
         request=request,
         headers={k.lower(): v for k, v in (headers or {}).items()},
         max_tool_laps=max_tool_laps,
+        retry=retry,
     )
     # Delivery turns (bridge_messaging) carry _bridge_no_tools: the recipient REPLIES
     # in words, with no tools, regardless of what context plugins inject. Stashed here;
@@ -973,6 +977,24 @@ def _build_outbound_request(ctx: PipelineCtx) -> tuple[str, dict, dict, float]:
         body["model"] = ctx.request.model
     body["stream"] = ctx.request.stream  # honour what the client asked for
 
+    # Operator-set outbound body params (OpenAI-Protocol `params:` — reasoning /
+    # temperature / provider / …). Merged AFTER assembly so CONFIG WINS over any
+    # same key the client sent (operator sovereignty, matching `model`). The
+    # bridge OWNS messages/model/stream/tools — assembly above is authoritative —
+    # so those keys are refused here even if a config typo lists them.
+    extra_params = ctx.plugin_data.get("openai-protocol.params", {})
+    if isinstance(extra_params, dict):
+        _reserved = {"messages", "model", "stream", "tools", "tool_choice"}
+        for k, v in extra_params.items():
+            if k in _reserved:
+                logger.warning(
+                    "OpenAI-Protocol params: refusing reserved key '%s' "
+                    "(bridge owns it) — set it via the dedicated config, not params.",
+                    k,
+                )
+                continue
+            body[k] = v
+
     headers: dict[str, str] = {"Content-Type": "application/json"}
     if ctx.resource.endpoint_token:
         headers["Authorization"] = f"Bearer {ctx.resource.endpoint_token}"
@@ -1003,21 +1025,49 @@ async def _do_http_call_nonstream(ctx: PipelineCtx) -> PipelineCtx:
         ctx.dev_trace, "upstream_request",
         method="POST", url=url, headers=headers, body=body,
     )
-    started = time.monotonic()
 
+    # Retry policy (NON-STREAM only, opt-in — see PipelineCtx.retry). attempts<=1
+    # or absent = single try = today's behaviour unchanged.
+    _r = ctx.retry if isinstance(ctx.retry, dict) else {}
+    _attempts = max(1, int(_r.get("attempts", 1) or 1))
+    _max_wait = float(_r.get("max_wait", 60) or 60)
+    _base = float(_r.get("base", 1) or 1)
+
+    started = time.monotonic()
     async with httpx.AsyncClient(timeout=timeout) as client:
-        try:
-            response = await client.post(url, json=body, headers=headers)
-        except httpx.HTTPError as e:
-            duration_ms = int((time.monotonic() - started) * 1000)
-            dev_trace.event(
-                ctx.dev_trace, "upstream_response",
-                status=f"network-error: {type(e).__name__}",
-                duration_ms=duration_ms,
-            )
-            raise PipelineFailure(
-                f"HTTP error calling {url}: {type(e).__name__}: {e!r}"
-            ) from e
+        for _attempt in range(_attempts):
+            try:
+                response = await client.post(url, json=body, headers=headers)
+            except httpx.HTTPError as e:
+                duration_ms = int((time.monotonic() - started) * 1000)
+                dev_trace.event(
+                    ctx.dev_trace, "upstream_response",
+                    status=f"network-error: {type(e).__name__}",
+                    duration_ms=duration_ms,
+                )
+                raise PipelineFailure(
+                    f"HTTP error calling {url}: {type(e).__name__}: {e!r}"
+                ) from e
+
+            # Retryable-throttle statuses: honour Retry-After, else backoff —
+            # but only if we have attempts left. Any other status (incl. other
+            # 4xx/5xx) falls straight through to the error handling below.
+            if response.status_code in (429, 503) and _attempt < _attempts - 1:
+                wait = _parse_retry_after(
+                    response.headers.get("retry-after"), _max_wait
+                )
+                if wait is None:
+                    wait = min(_base * (2 ** _attempt), _max_wait)
+                logger.warning(
+                    "Outbound %s from '%s' — retry %d/%d in %.1fs "
+                    "(Retry-After=%r)",
+                    response.status_code, ctx.resource.key,
+                    _attempt + 1, _attempts - 1, wait,
+                    response.headers.get("retry-after"),
+                )
+                await asyncio.sleep(wait)
+                continue
+            break
 
     duration_ms = int((time.monotonic() - started) * 1000)
 
@@ -1873,6 +1923,61 @@ def _resolve_max_tool_laps(
     if env_n is not None:
         return env_n
     return 1
+
+
+def _resolve_retry(
+    identity_cfg: dict,
+    role_cfg: dict,
+    session_cfg: dict,
+    resource_cfg: dict,
+    server_cfg: dict,
+) -> dict:
+    """Resolve the non-stream upstream retry policy top-down.
+
+    A bare ``retry:`` config block (like ``max_tool_laps``), cascade order
+    ``identity > role > session > resource > server``. First level that declares
+    a dict ``retry`` wins wholesale (no field-level merge — a level opts in with a
+    complete policy, matching how the buddy who needs retry is a specific identity/
+    role, not a scatter of half-policies). Absent everywhere → ``{}`` = OFF.
+
+    OFF by default on purpose: most callers arrive through a harness that already
+    retries; the bridge double-retrying would amplify a 429. Retry is opt-in for
+    the harness-less buddy (cron/autonomous) — portability, the resilience
+    travels with the buddy exactly where nothing else provides it."""
+    for cfg in (identity_cfg, role_cfg, session_cfg, resource_cfg, server_cfg):
+        if isinstance(cfg, dict) and isinstance(cfg.get("retry"), dict):
+            return cfg["retry"]
+    return {}
+
+
+def _parse_retry_after(value: str | None, max_wait: float) -> float | None:
+    """Parse a ``Retry-After`` header into a clamped wait in seconds.
+
+    Handles BOTH RFC-9110 forms: a delta-seconds integer (``120``) and an
+    HTTP-date (``Wed, 15 Jul 2026 09:30:00 GMT``). Returns the wait clamped to
+    ``[0, max_wait]`` — a past date or negative delta floors to 0 (a skewed
+    provider clock must not hand us a negative or absurd sleep), an over-long
+    hint caps at max_wait. Returns ``None`` if the header is absent or
+    unparseable (caller then falls back to its own backoff)."""
+    if not value:
+        return None
+    value = value.strip()
+    # delta-seconds form
+    try:
+        return max(0.0, min(float(int(value)), max_wait))
+    except (TypeError, ValueError):
+        pass
+    # HTTP-date form
+    try:
+        from email.utils import parsedate_to_datetime
+        when = parsedate_to_datetime(value)
+        if when is None:
+            return None
+        import datetime as _dt
+        now = _dt.datetime.now(when.tzinfo or _dt.timezone.utc)
+        return max(0.0, min((when - now).total_seconds(), max_wait))
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 def _extract_intercept_inputs(

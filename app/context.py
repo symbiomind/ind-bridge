@@ -235,6 +235,28 @@ class PipelineCtx:
     bare scalar config key (``max_tool_laps:``), not a plugin — same shape as
     ``timezone``."""
 
+    retry: dict = field(default_factory=dict)
+    """Upstream retry policy for the NON-STREAMING outbound call (cron /
+    autonomous agents — the machine path, where no human watches a spinner and no
+    harness re-knocks on the buddy's behalf). OFF by default (empty / attempts<=0):
+    the bridge stays a transparent pipe and never double-retries a harness that
+    already retries (LibreChat, the OpenAI SDK, …). Opt-in per cascade level, same
+    shape as ``max_tool_laps`` — a bare scalar-ish config block, not a plugin.
+
+    Keys (all optional):
+      ``attempts``  int   — total tries incl. the first. <=0 / absent = OFF.
+      ``max_wait``  float — clamp ceiling (seconds) for BOTH a Retry-After header
+                            and the exponential backoff. Default 60.
+      ``base``      float — backoff base seconds when no Retry-After header is
+                            present (1 → 2 → 4 …). Default 1.
+
+    Behaviour on a 429/503: honour a ``Retry-After`` header if present (seconds OR
+    HTTP-date, clamped to [0, max_wait]); otherwise exponential backoff (base * 2^n,
+    clamped). Bounded by ``attempts`` so amplification is impossible. STREAMING is
+    deliberately excluded — a silent backoff on a streamed request would starve the
+    client connection and recreate the LibreChat thinking-box hang. Resolved at
+    ctx-build time top-down (``identity → role → session → resource → server``)."""
+
     headers: dict[str, str] = field(default_factory=dict)
     """Sanitised inbound headers, lowercased keys. Hop-by-hop headers
     stripped at intake."""
